@@ -1,0 +1,8 @@
+# 忽略 LLaMA-Factory 下的所有内容
+LLaMA-Factory/*
+# 但是！不要忽略 .gitkeep 文件（从而达到保留文件夹的目的）
+!LLaMA-Factory/.gitkeep
+
+# 同理，忽略 verl 下的所有内容
+verl/*
+!verl/.gitkeep

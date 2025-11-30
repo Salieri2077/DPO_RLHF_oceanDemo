@@ -1,0 +1,65 @@
+source /etc/network_turbo
+
+pip install -e ".[torch,metrics]"
+
+pkill -9 python
+watch -n 1 nvidia-smi
+
+nohup python eval_ocean.py   > eval_ocean.log 2>&1 &
+
+nohup bash -c "python inference.py >> inference.log 2>&1 && shutdown -h now" &
+nohup bash -c "python inference.py >> inference.log 2>&1 ; shutdown -h now" &
+nohup python inference.py   > inference.log 2>&1 &
+
+nohup bash -c "python Ranking_Pairing.py >> Ranking_Pairing.log 2>&1 ; shutdown -h now" &
+
+mv ocean_dpo_data.json /root/autodl-tmp/target_1/LLaMA-Factory/data/
+修改注册表： 编辑 /root/autodl-tmp/target_1/LLaMA-Factory/data/dataset_info.json，在里面添加以下内容（注意 JSON 格式，别漏了逗号）：
+"ocean_dpo": {
+  "file_name": "ocean_dpo_data.json",
+  "ranking": true,
+  "formatting": "sharegpt",
+  "columns": {
+    "messages": "conversations",
+    "chosen": "chosen",
+    "rejected": "rejected"
+  }
+}
+
+#!/bin/bash
+cd /root/autodl-tmp/target_1/LLaMA-Factory
+
+run_dpo.sh：
+# 显存清理（好习惯）
+export CUDA_VISIBLE_DEVICES=0
+
+echo "开始 DPO 训练..."
+
+nohup llamafactory-cli train \
+    --stage dpo \
+    --do_train \
+    --model_name_or_path /root/autodl-tmp/Qwen2.5-7B-Instruct \
+    --adapter_name_or_path /root/autodl-tmp/checkpoints/ocean_qwen_sft_v1 \
+    --dataset ocean_dpo \
+    --template qwen \
+    --finetuning_type lora \
+    --lora_target all \
+    --output_dir /root/autodl-tmp/checkpoints/ocean_qwen_dpo_v1 \
+    --overwrite_output_dir \
+    --quantization_bit 4 \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --learning_rate 5e-6 \
+    --num_train_epochs 1.0 \
+    --lr_scheduler_type cosine \
+    --warmup_ratio 0.1 \
+    --fp16 \
+    --logging_steps 5 \
+    --save_steps 50 \
+    --plot_loss \
+    --pref_beta 0.1 \
+    --pref_ftx 0 \
+    --pref_loss sigmoid \
+    > ../train_dpo.log 2>&1 &
+
+echo "DPO 训练已后台启动！请查看 ../train_dpo.log"
