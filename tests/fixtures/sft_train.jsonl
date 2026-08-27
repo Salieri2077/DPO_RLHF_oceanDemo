@@ -1,0 +1,4 @@
+{"conversations":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"什么是潮汐？"},{"role":"assistant","content":"潮汐是海面周期性涨落。"}]}
+{"conversations":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"什么是海啸？"},{"role":"assistant","content":"海啸是海底扰动产生的长波。"}]}
+{"conversations":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"海水为何有盐？"},{"role":"assistant","content":"岩石风化和海底过程向海洋输入溶解盐。"}]}
+{"conversations":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"解释海洋环流。"},{"role":"assistant","content":"海洋环流是海水大尺度持续运动。"}]}

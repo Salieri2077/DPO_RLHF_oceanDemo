@@ -1,0 +1,9 @@
+OceanHeart
+Copyright 2026 Salieri2077
+
+This product includes software derived from MiniMind by Jingyao Gong,
+licensed under the Apache License 2.0. The imported text-training baseline is
+upstream commit 753d504; uncommitted local MiniMind changes were excluded.
+
+OceanInstruct-v0.2 is released by the OceanGPT authors under the MIT license.
+See data/raw/ocean_instruct/README.md for its citation and dataset notice.
