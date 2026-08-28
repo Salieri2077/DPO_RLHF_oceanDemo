@@ -28,7 +28,7 @@ from trainer.trainer_utils import (
 )
 
 
-def build_parser(description, defaults):
+def build_parser(description, defaults, use_lora=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--save_dir", default="../out")
     parser.add_argument("--save_weight", default=defaults["save_weight"])
@@ -50,7 +50,7 @@ def build_parser(description, defaults):
     parser.add_argument("--max_seq_len", type=int, default=defaults["max_seq_len"])
     parser.add_argument("--use_moe", type=int, choices=[0, 1], default=0)
     parser.add_argument("--data_path", default=defaults["data_path"])
-    parser.add_argument("--val_data_path", default=None)
+    parser.add_argument("--val_data_path", default=defaults.get("val_data_path"))
     parser.add_argument("--from_weight", default=defaults["from_weight"])
     parser.add_argument("--from_resume", type=int, choices=[0, 1], default=0)
     parser.add_argument("--use_swanlab", "--use_wandb", dest="use_swanlab", action="store_true")
@@ -59,16 +59,23 @@ def build_parser(description, defaults):
     parser.add_argument("--swanlab_project", "--wandb_project", dest="swanlab_project", default=defaults["project"])
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--use_compile", type=int, choices=[0, 1], default=0)
+    if use_lora:
+        parser.add_argument("--lora_rank", type=int, default=16)
     return parser
 
 
-def run_lm_training(dataset_class, description, defaults):
-    args = build_parser(description, defaults).parse_args()
+def run_lm_training(dataset_class, description, defaults, use_lora=False):
+    args = build_parser(description, defaults, use_lora).parse_args()
+    lora_compile_disabled = use_lora and bool(args.use_compile)
+    if lora_compile_disabled:
+        args.use_compile = 0
     local_rank = init_distributed_mode()
     if dist.is_initialized():
         args.device = f"cuda:{local_rank}"
     rank = dist.get_rank() if dist.is_initialized() else 0
     setup_seed(42 + rank)
+    if lora_compile_disabled:
+        Logger("LoRA uses patched attention forwards; torch.compile disabled")
     os.makedirs(args.save_dir, exist_ok=True)
 
     lm_config = MiniMindConfig(
@@ -98,6 +105,15 @@ def run_lm_training(dataset_class, description, defaults):
         )
 
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    if use_lora:
+        from model.model_lora import apply_lora
+
+        targets = apply_lora(model, args.lora_rank)
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = ".lora." in name
+        trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        total = sum(parameter.numel() for parameter in model.parameters())
+        Logger(f"LoRA targets: {targets}, trainable: {trainable / 1e6:.3f}M ({100 * trainable / total:.2f}%)")
     train_ds = dataset_class(args.data_path, tokenizer, max_length=args.max_seq_len)
     val_ds = dataset_class(args.val_data_path, tokenizer, max_length=args.max_seq_len) if args.val_data_path else None
     if val_ds is not None and hasattr(val_ds, "deterministic"):
@@ -105,7 +121,7 @@ def run_lm_training(dataset_class, description, defaults):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers) if val_ds else None
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler("cuda", enabled=device_type == "cuda" and args.dtype == "float16")
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW((parameter for parameter in model.parameters() if parameter.requires_grad), lr=args.learning_rate)
 
     start_epoch = start_step = 0
     if ckp_data:
@@ -126,10 +142,16 @@ def run_lm_training(dataset_class, description, defaults):
         raw_model = getattr(raw_model, "_orig_mod", raw_model)
         suffix = "_moe" if lm_config.use_moe else ""
         path = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{suffix}.pth"
-        state = {key: value.half().cpu() for key, value in raw_model.state_dict().items()}
-        temp = path + ".tmp"
-        torch.save(state, temp)
-        os.replace(temp, path)
+        if use_lora:
+            from model.model_lora import save_lora, save_merged_lora
+
+            save_lora(raw_model, path)
+            save_merged_lora(raw_model, f"{args.save_dir}/{args.save_weight}_merged_{lm_config.hidden_size}{suffix}.pth")
+        else:
+            state = {key: value.half().cpu() for key, value in raw_model.state_dict().items()}
+            temp = path + ".tmp"
+            torch.save(state, temp)
+            os.replace(temp, path)
         lm_checkpoint(
             lm_config,
             weight=args.save_weight,
@@ -141,7 +163,8 @@ def run_lm_training(dataset_class, description, defaults):
             wandb=tracker,
             save_dir="../checkpoints",
         )
-        del state
+        if not use_lora:
+            del state
 
     def validate(global_update, full=False):
         nonlocal tracker
