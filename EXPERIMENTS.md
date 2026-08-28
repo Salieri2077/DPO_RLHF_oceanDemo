@@ -8,6 +8,8 @@
 | ocean-sft-pure | | | SFT / Ocean 100% | E2, S768, LR1e-5 | | | | | |
 | ocean-sft-replay | | | SFT / Ocean 90% + general 10% | E2, S768, LR1e-5 | | | | | |
 | ocean-dpo | | | DPO / ocean preference | E2, S1024, LR4e-8, β0.15 | | | | | |
+| ocean-lora | | | LoRA / Ocean 90% + general 10% | E2, r16, S768, LR1e-4 | | | | | |
+| ocean-grpo-20steps | | | GRPO / Ocean + SiliconFlow judge | 20 steps, G4, S768+256, LR3e-7, β0.1 | | | | | |
 
 ## 曲线诊断
 
@@ -17,6 +19,8 @@
 - manifest 截断率超过 10%：序列长度改 1024，每卡 batch 1、累积 32。
 - Ocean 指标改善但 Generic PPL 恶化超过 10%：采用回放版本。
 - DPO accuracy/margin 未提升：先审计偏好对，再考虑增加数据。
+- GRPO `group_std` 接近 0 或退化组比例高：先检查裁判区分度和候选多样性，不调大学习率。
+- GRPO reward 上升但 Ocean PPL/固定回答变差：保留 SFT/DPO 权重，降低规则奖励或审计奖励投机样本。
 
 ## 本轮观察
 

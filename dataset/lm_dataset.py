@@ -195,7 +195,7 @@ class DPODataset(Dataset):
 
 
 class RLAIFDataset(Dataset):
-    def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.5):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024, thinking_ratio=0.0):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -208,7 +208,7 @@ class RLAIFDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
-        conversations = pre_processing_chat(conversations)
+        conversations = conversations
         use_thinking = random.random() < self.thinking_ratio
         return self.tokenizer.apply_chat_template(
             conversations[:-1],
@@ -219,10 +219,10 @@ class RLAIFDataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         prompt = self.create_chat_prompt(sample['conversations'])
-
         return {
             'prompt': prompt,
-            'answer': ""
+            'question': next(message['content'] for message in reversed(sample['conversations']) if message['role'] == 'user'),
+            'answer': sample['conversations'][-1]['content']
         }
 
 class AgentRLDataset(Dataset):

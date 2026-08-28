@@ -121,7 +121,10 @@ def atomic_json(path, value):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--weights", nargs="+", default=["pretrain", "ocean_sft_pure", "ocean_sft_replay", "ocean_dpo"])
+    parser.add_argument(
+        "--weights", nargs="+",
+        default=["pretrain", "ocean_lora_merged", "ocean_sft_pure", "ocean_sft_replay", "ocean_dpo", "ocean_grpo"],
+    )
     parser.add_argument("--save-dir", type=Path, default=ROOT / "out")
     parser.add_argument("--ocean-test", type=Path, default=ROOT / "data/processed/ocean_sft_test.jsonl")
     parser.add_argument("--generic-test", type=Path, default=ROOT / "data/processed/generic_sft_eval.jsonl")
