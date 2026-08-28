@@ -10,6 +10,8 @@
 | ocean-dpo | | | DPO / ocean preference | E2, S1024, LR4e-8, β0.15 | | | | | |
 | ocean-lora | | | LoRA / Ocean 90% + general 10% | E2, r16, S768, LR1e-4 | | | | | |
 | ocean-grpo-20steps | | | GRPO / Ocean + SiliconFlow judge | 20 steps, G4, S768+256, LR3e-7, β0.1 | | | | | |
+| smoke-ocean-lora | 026e9b5 | c5c917ea32d09ef515d2691268acee22de7a5d89753bfd8611a62c28ae02363d | LoRA / replay | 4 GPU, 10→20 steps resume, r16 | 2.9149 | 18.45 | | | 通过；同一 SwanLab run ID 连续 |
+| smoke-ocean-lora-moe | 026e9b5 | c5c917ea32d09ef515d2691268acee22de7a5d89753bfd8611a62c28ae02363d | MoE LoRA / replay | 4 GPU, 2 steps, r16, S128 | | | | | forward/backward、保存均通过 |
 
 ## 曲线诊断
 
@@ -28,4 +30,6 @@
 - 训练稳定性：4×2080 Ti 上微型 Pretrain、两组 SFT、DPO 均完成 20 optimizer steps，loss 有限且 SwanLab offline 正常；DPO rank 0 验证的 collective 顺序问题已由两卡续训回归覆盖。
 - 泛化与遗忘：等待完整 A/B 训练后填写 Ocean/Generic PPL 变化。
 - DPO 行为变化：等待完整训练后填写 accuracy 与 reward margin。
+- LoRA 烟测：Dense 4 卡先跑 10 optimizer steps，再从 checkpoint 续到 20；val loss `3.0683 → 2.9149`，PPL `21.51 → 18.45`。adapter 为 0.393M 参数（Dense 0.61%，MoE 0.20%），adapter/merged/resume 三类权重均成功保存。
+- GRPO 烟测：CPU 已覆盖原生 rollout→policy backward、GRPO clip/KL、Ocean 分组 Judge 严格 JSON 与重试、微型 MoE backward。Codex 进程未继承终端中的 `SILICONFLOW_API_KEY`，因此未擅自发起付费 20-step 在线裁判训练。
 - 下一轮只改变的变量：先完成 768-token A/B 基线；随后按规则只把 SFT 改为 seq 1024、每卡 batch 1、累积 32，比较截断改善。
