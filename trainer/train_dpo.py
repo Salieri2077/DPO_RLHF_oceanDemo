@@ -159,8 +159,8 @@ if __name__ == "__main__":
             config=experiment_config(args),
         )
 
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    ref_model, _ = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
     ref_model.eval().requires_grad_(False)
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     val_ds = DPODataset(args.val_data_path, tokenizer, max_length=args.max_seq_len, deterministic=True) if args.val_data_path else None

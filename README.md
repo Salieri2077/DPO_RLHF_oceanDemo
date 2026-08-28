@@ -24,6 +24,19 @@ python scripts/prepare_ocean_grpo.py
 
 生成文件位于 `data/processed/`，不会提交到 Git。`manifest.json` 记录数据来源、许可、稳定切分、过滤数量、token 长度和截断率。Ocean 数据按规范化问题哈希做 80/10/10 切分，DPO 与 SFT 的相同问题始终进入同一集合。
 
+## Dense 与 MoE 权重规则
+
+`--from_weight` 传的是权重名前缀，不是完整路径。训练器会在 `--save_dir`（默认 `../out`）中按模型结构自动补齐文件名：
+
+| 阶段 | 参数 | Dense 实际文件 | `--use_moe 1` 实际文件 |
+|---|---|---|---|
+| Pretrain 输出 | `--save_weight pretrain` | `../out/pretrain_768.pth` | `../out/pretrain_768_moe.pth` |
+| SFT 输入 | `--from_weight pretrain` | `../out/pretrain_768.pth` | `../out/pretrain_768_moe.pth` |
+| SFT 输出 | `--save_weight ocean_sft_replay` | `../out/ocean_sft_replay_768.pth` | `../out/ocean_sft_replay_768_moe.pth` |
+| DPO/GRPO 输入 | `--from_weight ocean_sft_replay` | `../out/ocean_sft_replay_768.pth` | `../out/ocean_sft_replay_768_moe.pth` |
+
+因此 Dense 和 MoE 会自动分开加载、保存，不会互相覆盖。架构必须贯穿整条链路：MoE SFT 必须增加 `--use_moe 1`，并从 MoE Pretrain 权重开始；后续 MoE DPO/GRPO 同理。训练 checkpoint 另存于 `../checkpoints/`，并带相同的 `_moe` 后缀和 `_resume` 续训后缀。
+
 ## 四卡烟测
 
 所有训练命令从 `trainer/` 运行。先以 SwanLab offline 模式各跑 20 个 optimizer steps：
@@ -54,6 +67,8 @@ torchrun --standalone --nproc_per_node=4 train_dpo.py \
 
 ### 1. 通用预训练
 
+#### Dense Pretrain
+
 ```bash
 torchrun --standalone --nproc_per_node=4 train_pretrain.py \
   --epochs 2 --dtype float16 --batch_size 16 --accumulation_steps 4 \
@@ -65,9 +80,23 @@ torchrun --standalone --nproc_per_node=4 train_pretrain.py \
 
 若 11GB 显存 OOM，只改为 `--batch_size 8 --accumulation_steps 8`，有效 batch 不变。
 
+#### MoE Pretrain
+
+MoE 使用 4 experts、top-1 路由，总参数约 198.4M，每个 token 激活约 63.9M。`--use_moe 1` 会自动保存为 `pretrain_768_moe.pth`：
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_pretrain.py \
+  --use_moe 1 --save_weight pretrain \
+  --epochs 2 --dtype float16 --batch_size 8 --accumulation_steps 8 \
+  --max_seq_len 340 --learning_rate 5e-4 \
+  --data_path ../data/processed/pretrain_train.jsonl \
+  --val_data_path ../data/processed/pretrain_val.jsonl \
+  --use_swanlab --swanlab_project OceanHeart-Pretrain --run_name baseline-pretrain-moe
+```
+
 ### 2. 海洋 SFT 对照
 
-两次训练必须使用同一个 `pretrain_768.pth`、seed 和参数，只改变数据：
+Dense 的两次训练必须使用同一个 `pretrain_768.pth`、seed 和参数，只改变数据：
 
 ```bash
 torchrun --standalone --nproc_per_node=4 train_full_sft.py \
@@ -87,6 +116,28 @@ torchrun --standalone --nproc_per_node=4 train_full_sft.py \
   --use_swanlab --swanlab_project OceanHeart-SFT --run_name ocean-sft-replay
 ```
 
+MoE SFT 使用相同数据对照和超参数，但两条命令都增加 `--use_moe 1`；它会自动加载 `pretrain_768_moe.pth` 并保存带 `_moe` 后缀的结果：
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_full_sft.py \
+  --use_moe 1 --save_weight ocean_sft_pure --from_weight pretrain \
+  --data_path ../data/processed/ocean_sft_train.jsonl \
+  --val_data_path ../data/processed/ocean_sft_val.jsonl \
+  --epochs 2 --dtype float16 --batch_size 2 --accumulation_steps 16 \
+  --max_seq_len 768 --learning_rate 1e-5 \
+  --use_swanlab --swanlab_project OceanHeart-SFT --run_name ocean-sft-pure-moe
+
+torchrun --standalone --nproc_per_node=4 train_full_sft.py \
+  --use_moe 1 --save_weight ocean_sft_replay --from_weight pretrain \
+  --data_path ../data/processed/ocean_sft_replay_train.jsonl \
+  --val_data_path ../data/processed/ocean_sft_val.jsonl \
+  --epochs 2 --dtype float16 --batch_size 2 --accumulation_steps 16 \
+  --max_seq_len 768 --learning_rate 1e-5 \
+  --use_swanlab --swanlab_project OceanHeart-SFT --run_name ocean-sft-replay-moe
+```
+
+若 MoE SFT 在 11GB 显存上 OOM，改为每卡 `--batch_size 1 --accumulation_steps 32`，保持有效 batch 不变。
+
 ### 3. 海洋 DPO
 
 ```bash
@@ -96,6 +147,8 @@ torchrun --standalone --nproc_per_node=4 train_dpo.py \
   --max_seq_len 1024 --learning_rate 4e-8 --beta 0.15 \
   --use_swanlab --swanlab_project OceanHeart-DPO --run_name ocean-dpo
 ```
+
+MoE DPO 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--run_name ocean-dpo-moe`；它会自动加载 `ocean_sft_replay_768_moe.pth` 并保存 `ocean_dpo_768_moe.pth`。
 
 ### 4. 海洋 LoRA 对照
 
@@ -111,7 +164,7 @@ torchrun --standalone --nproc_per_node=4 train_lora.py \
   --use_swanlab --swanlab_project OceanHeart-LoRA --run_name ocean-lora
 ```
 
-如需验证 MoE LoRA，只增加 `--use_moe 1`，并确保已有同架构的 `pretrain_768_moe.pth`。
+MoE LoRA 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--run_name ocean-lora-moe`；它会自动加载 `pretrain_768_moe.pth`，适配器和合并权重分别保存为 `ocean_lora_768_moe.pth`、`ocean_lora_merged_768_moe.pth`。
 
 ### 5. 海洋 GRPO（首轮 20 steps）
 
@@ -131,7 +184,9 @@ torchrun --standalone --nproc_per_node=4 train_grpo.py \
   --use_swanlab --swanlab_project OceanHeart-GRPO --run_name ocean-grpo-20steps
 ```
 
-4 卡、每卡 batch 1 时，20 steps 约产生 80 次训练裁判请求；默认的启动验证与两次周期验证各最多 2 batch，另有少量请求。费用和耗时以 SiliconFlow 当时的模型计费为准。代码支持 `--use_moe 1`，但 2080 Ti 上先只做有限烟测，不直接开启长跑。
+4 卡、每卡 batch 1 时，20 steps 约产生 80 次训练裁判请求；默认的启动验证与两次周期验证各最多 2 batch，另有少量请求。费用和耗时以 SiliconFlow 当时的模型计费为准。
+
+MoE GRPO 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--run_name ocean-grpo-moe`；它会自动加载 `ocean_sft_replay_768_moe.pth`。由于 policy、reference 和 rollout 同时占用显存，2080 Ti 上先将 `--max_steps` 设为 2 做烟测，再决定是否长跑。
 
 ## 离线评估
 

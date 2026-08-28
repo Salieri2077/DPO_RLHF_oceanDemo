@@ -142,8 +142,8 @@ if __name__ == "__main__":
             resume="must" if run_id else None, mode=args.swanlab_mode,
             logdir=args.swanlab_logdir, config=experiment_config(args),
         )
-    model, tokenizer = init_model(config, args.from_weight, device=args.device)
-    reference, _ = init_model(config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    reference, _ = init_model(config, args.from_weight, save_dir=args.save_dir, device=args.device)
     reference.eval().requires_grad_(False)
     judge = SiliconFlowRewardModel(api_key, args.reward_model)
     train_ds = RLAIFDataset(args.data_path, tokenizer, args.max_seq_len, args.thinking_ratio)

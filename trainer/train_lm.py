@@ -104,7 +104,7 @@ def run_lm_training(dataset_class, description, defaults, use_lora=False):
             config=experiment_config(args),
         )
 
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
     if use_lora:
         from model.model_lora import apply_lora
 
