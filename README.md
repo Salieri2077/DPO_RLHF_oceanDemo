@@ -138,6 +138,31 @@ torchrun --standalone --nproc_per_node=4 train_full_sft.py \
 
 若 MoE SFT 在 11GB 显存上 OOM，改为每卡 `--batch_size 1 --accumulation_steps 32`，保持有效 batch 不变。
 
+#### SFT Pure vs Replay 评估
+
+Pure 曲线更短不是 early stopping：当前训练代码没有开启 early stop。Pure 有 40,152 条样本，Replay 有 44,614 条；在 4 卡、每卡 batch 2、累积 16、训练 2 epochs 时，理论上分别约为 628 和 698 个 optimizer steps。
+
+正式对比位于 [`SFT Evaluation`](./SFT%20Evaluation/README.md)，固定比较 Pretrain（SFT 前基线）、Pure 和 Replay，并复用现有数据完成：
+
+| 评估面 | 指标 | 用途 |
+|---|---|---|
+| Ocean SFT test | assistant-token NLL / PPL | 海洋领域拟合 |
+| Generic SFT eval | assistant-token NLL / PPL | 灾难性遗忘 |
+| 5 个现有多领域 benchmark | chat-template 长度归一化候选准确率 | 海洋、通用中英文和科学推理迁移 |
+| 固定海洋 prompts | greedy 生成、吞吐、可选 SiliconFlow 裁判 | 实际回答质量与风格 |
+
+```bash
+/home/anhuang/.conda/envs/minimind/bin/python \
+  "SFT Evaluation/evaluator.py" --architecture dense
+
+/home/anhuang/.conda/envs/minimind/bin/python \
+  "SFT Evaluation/evaluator.py" --architecture moe
+```
+
+快速检查可加 `--max-samples 5 --generation-samples 2`。评估输出 Pure vs Replay 的逐样本差值、2,000 次配对 bootstrap 95% 区间和 Markdown/CSV 汇总；现有 `eval_ocean.py` 继续作为跨 Pretrain/SFT/DPO/GRPO 的轻量全流程体检入口。
+
+注意：当前 Pure 与 Replay 是相同 epoch，而 Replay 数据多约 11%，所以不是严格固定 token 预算的单变量实验。若要严谨归因，应再补一组相同 `max_steps` 的训练。
+
 ### 3. 海洋 DPO
 
 ```bash
