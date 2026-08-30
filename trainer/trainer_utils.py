@@ -13,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 import hashlib
+import secrets
+import string
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -65,6 +67,30 @@ def safe_swanlab_log(swanlab, data, step=None):
         return None
 
 
+def swanlab_run_id(checkpoint, mode='cloud'):
+    existing = (checkpoint or {}).get('swanlab_id') or (checkpoint or {}).get('wandb_id')
+    if mode != 'cloud':
+        return None, None
+    if existing:
+        return existing, 'must'
+    alphabet = string.ascii_lowercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(21)), 'allow'
+
+
+def init_swanlab(swanlab, checkpoint, mode, **kwargs):
+    run_id, resume = swanlab_run_id(checkpoint, mode)
+    existing = (checkpoint or {}).get('swanlab_id') or (checkpoint or {}).get('wandb_id')
+    if existing and mode != 'cloud':
+        kwargs['config']['resumed_from_swanlab_id'] = existing
+    random_state = random.getstate()
+    try:
+        if mode != 'cloud':
+            random.seed(secrets.randbits(128))
+        return swanlab.init(id=run_id, resume=resume, mode=mode, **kwargs)
+    finally:
+        random.setstate(random_state)
+
+
 def experiment_config(args):
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     try:
@@ -73,7 +99,12 @@ def experiment_config(args):
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         config['git_commit'] = 'unknown'
-    manifest_name = 'grpo_manifest.json' if 'grpo' in Path(args.data_path).name else 'manifest.json'
+    data_name = Path(args.data_path).name
+    manifest_name = (
+        'opd_manifest.json' if 'opd' in data_name
+        else 'grpo_manifest.json' if 'grpo' in data_name
+        else 'manifest.json'
+    )
     manifest = Path(args.data_path).resolve().parent / manifest_name
     if manifest.exists():
         config['data_manifest_sha256'] = hashlib.sha256(manifest.read_bytes()).hexdigest()
@@ -175,6 +206,8 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             if hasattr(wandb, 'get_run'):
                 run = wandb.get_run()
                 swanlab_id = getattr(run, 'id', None) if run else None
+                if not swanlab_id and run:
+                    swanlab_id = getattr(getattr(run, 'public', None), 'run_id', None)
             else:
                 swanlab_id = getattr(wandb, 'id', None)
 

@@ -30,7 +30,7 @@ def rollout(model, tokenizer, prompt_ids, attention_mask, num_generations, max_n
     raw.eval()
     repeated_ids = prompt_ids.repeat_interleave(num_generations, 0)
     repeated_mask = attention_mask.repeat_interleave(num_generations, 0)
-    output_ids = raw.generate(
+    generated_ids = raw.generate(
         input_ids=repeated_ids,
         attention_mask=repeated_mask,
         max_new_tokens=max_new_tokens,
@@ -38,7 +38,11 @@ def rollout(model, tokenizer, prompt_ids, attention_mask, num_generations, max_n
         temperature=temperature,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
-    ).clone()
+    )
+    # MiniMind.generate uses inference_mode; clone with it explicitly disabled so
+    # the sampled ids can safely feed the following autograd-enabled policy pass.
+    with torch.inference_mode(False):
+        output_ids = generated_ids.clone()
     prompt_length = prompt_ids.size(1)
     completion_ids = output_ids[:, prompt_length:]
     completion_mask = completion_ids.ne(tokenizer.pad_token_id)

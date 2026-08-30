@@ -22,6 +22,7 @@ from trainer.trainer_utils import (
     SkipBatchSampler,
     experiment_config,
     get_lr,
+    init_swanlab,
     init_distributed_mode,
     init_model,
     is_main_process,
@@ -147,14 +148,11 @@ if __name__ == "__main__":
     if args.use_swanlab and is_main_process():
         import swanlab
 
-        run_id = (ckp_data or {}).get("swanlab_id") or (ckp_data or {}).get("wandb_id")
         tracker = swanlab
-        tracker.init(
+        init_swanlab(
+            tracker, ckp_data, args.swanlab_mode,
             project=args.swanlab_project,
             name=args.run_name or f"OceanHeart-DPO-E{args.epochs}-B{args.batch_size}-LR{args.learning_rate}",
-            id=run_id,
-            resume="must" if run_id else None,
-            mode=args.swanlab_mode,
             logdir=args.swanlab_logdir,
             config=experiment_config(args),
         )

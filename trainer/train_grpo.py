@@ -21,7 +21,7 @@ from model.model_minimind import MiniMindConfig
 from trainer.rollout_engine import completion_log_probs, rollout
 from trainer.trainer_utils import (
     Logger, MetricWindow, SkipBatchSampler, SiliconFlowRewardModel, experiment_config,
-    get_lr, init_distributed_mode, init_model, is_main_process, lm_checkpoint,
+    get_lr, init_distributed_mode, init_model, init_swanlab, is_main_process, lm_checkpoint,
     reduce_sums, safe_swanlab_log, setup_seed,
 )
 
@@ -135,11 +135,10 @@ if __name__ == "__main__":
     tracker = None
     if args.use_swanlab and is_main_process():
         import swanlab
-        run_id = (checkpoint or {}).get("swanlab_id")
         tracker = swanlab
-        tracker.init(
-            project=args.swanlab_project, name=args.run_name or "ocean-grpo", id=run_id,
-            resume="must" if run_id else None, mode=args.swanlab_mode,
+        init_swanlab(
+            tracker, checkpoint, args.swanlab_mode,
+            project=args.swanlab_project, name=args.run_name or "ocean-grpo",
             logdir=args.swanlab_logdir, config=experiment_config(args),
         )
     model, tokenizer = init_model(config, args.from_weight, save_dir=args.save_dir, device=args.device)
@@ -211,10 +210,12 @@ if __name__ == "__main__":
             prompt_mask = inputs["attention_mask"][:, -args.max_seq_len:]
             with autocast:
                 result = rollout(model, tokenizer, prompt_ids, prompt_mask, args.num_generations, args.max_gen_len, args.temperature)
-                rewards, api_latency, api_calls = score_responses(judge, batch["question"], batch["answer"], result.completions, args.num_generations, args.device)
-                api_calls_total += api_calls
-                advantages, group_stds = group_advantages(rewards, args.num_generations)
-                full_mask = result.output_ids.ne(tokenizer.pad_token_id).long()
+            rewards, api_latency, api_calls = score_responses(judge, batch["question"], batch["answer"], result.completions, args.num_generations, args.device)
+            api_calls_total += api_calls
+            advantages, group_stds = group_advantages(rewards, args.num_generations)
+            full_mask = result.output_ids.ne(tokenizer.pad_token_id).long()
+            # Do not reuse generate's inference-mode autocast cache for training.
+            with autocast:
                 output = model(
                     result.output_ids, attention_mask=full_mask,
                     logits_to_keep=result.completion_ids.size(1) + 1,

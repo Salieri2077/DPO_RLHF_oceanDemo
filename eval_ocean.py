@@ -69,9 +69,14 @@ def preference_metrics(model, loader, device, autocast):
 
 
 def load_model(weight, args):
-    config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=False)
+    config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=bool(args.use_moe),
+    )
     model = MiniMindForCausalLM(config)
-    checkpoint = args.save_dir / f"{weight}_{args.hidden_size}.pth"
+    suffix = "_moe" if args.use_moe else ""
+    checkpoint = args.save_dir / f"{weight}_{args.hidden_size}{suffix}.pth"
     model.load_state_dict(torch.load(checkpoint, map_location="cpu"), strict=True)
     model = model.eval().to(args.device)
     return model.half() if args.device.startswith("cuda") else model
@@ -123,7 +128,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--weights", nargs="+",
-        default=["pretrain", "ocean_lora_merged", "ocean_sft_pure", "ocean_sft_replay", "ocean_dpo", "ocean_grpo"],
+        default=[
+            "pretrain", "ocean_lora_merged", "ocean_sft_pure", "ocean_sft_replay",
+            "ocean_dpo", "ocean_grpo", "ocean_opd", "general_opd", "ocean_mopd",
+        ],
     )
     parser.add_argument("--save-dir", type=Path, default=ROOT / "out")
     parser.add_argument("--ocean-test", type=Path, default=ROOT / "data/processed/ocean_sft_test.jsonl")
@@ -132,12 +140,15 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts/eval")
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--num-hidden-layers", type=int, default=8)
+    parser.add_argument("--use-moe", type=int, choices=[0, 1], default=0)
     parser.add_argument("--max-seq-len", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-eval-samples", type=int, default=0)
     parser.add_argument("--generation-samples", type=int, default=100)
     parser.add_argument("--judge", choices=["none", "siliconflow"], default="none")
+    parser.add_argument("--judge-baseline", default="ocean_sft_replay")
+    parser.add_argument("--judge-candidates", nargs="+", default=["ocean_opd", "ocean_mopd"])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -158,7 +169,8 @@ def main():
 
     summary, rows = {}, [{"prompt": prompt} for prompt in prompts]
     for weight in args.weights:
-        checkpoint = args.save_dir / f"{weight}_{args.hidden_size}.pth"
+        suffix = "_moe" if args.use_moe else ""
+        checkpoint = args.save_dir / f"{weight}_{args.hidden_size}{suffix}.pth"
         if not checkpoint.exists():
             print(f"skip missing checkpoint: {checkpoint}")
             continue
@@ -183,15 +195,33 @@ def main():
         api_key = os.environ.get("SILICONFLOW_API_KEY")
         if not api_key:
             print("SILICONFLOW_API_KEY is absent; skip optional judge")
-        elif "ocean_sft_replay" in summary and "ocean_dpo" in summary:
+        elif args.judge_baseline in summary:
             judge = SiliconFlowRewardModel(api_key)
-            wins = {"ocean_sft_replay": 0, "ocean_dpo": 0, "tie": 0}
-            for row in rows:
-                messages = [{"role": "user", "content": row["prompt"]}]
-                left = judge.get_score(messages, row["ocean_sft_replay"])
-                right = judge.get_score(messages, row["ocean_dpo"])
-                wins["ocean_sft_replay" if left > right else "ocean_dpo" if right > left else "tie"] += 1
-            summary["siliconflow_judge"] = wins
+            comparisons = {}
+            messages = [[{"role": "user", "content": row["prompt"]}] for row in rows]
+            baseline_scores = [
+                judge.get_score(message, row[args.judge_baseline])
+                for message, row in zip(messages, rows)
+            ]
+            for candidate in args.judge_candidates:
+                if candidate not in summary:
+                    continue
+                wins = {args.judge_baseline: 0, candidate: 0, "tie": 0}
+                for message, row, left in zip(messages, rows, baseline_scores):
+                    right = judge.get_score(message, row[candidate])
+                    wins[args.judge_baseline if left > right else candidate if right > left else "tie"] += 1
+                comparisons[candidate] = wins
+            summary["siliconflow_judge"] = comparisons
+
+    if all(weight in summary for weight in ("ocean_opd", "general_opd", "ocean_mopd")):
+        ocean_gap = summary["ocean_mopd"]["ocean"]["nll"] - summary["ocean_opd"]["ocean"]["nll"]
+        general_gap = summary["ocean_mopd"]["generic"]["nll"] - summary["general_opd"]["generic"]["nll"]
+        summary["opd_integration_gap"] = {
+            "definition": "MOPD NLL minus matching single-domain OPD NLL; lower is better",
+            "ocean_nll": ocean_gap,
+            "general_nll": general_gap,
+            "weighted_80_20_nll": 0.8 * ocean_gap + 0.2 * general_gap,
+        }
 
     atomic_json(args.output_dir / "summary.json", summary)
     jsonl = args.output_dir / "generations.jsonl"
@@ -208,6 +238,32 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     os.replace(temp, csv_path)
+
+    metrics_path = args.output_dir / "metrics.csv"
+    temp = metrics_path.with_suffix(".csv.tmp")
+    metric_columns = [
+        "weight", "use_moe", "ocean_nll", "ocean_ppl", "generic_nll", "generic_ppl",
+        "preference_accuracy", "preference_margin", "generation_tokens_per_second",
+    ]
+    with temp.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=metric_columns)
+        writer.writeheader()
+        for weight in args.weights:
+            if weight not in summary:
+                continue
+            metrics = summary[weight]
+            writer.writerow({
+                "weight": weight,
+                "use_moe": args.use_moe,
+                "ocean_nll": metrics["ocean"]["nll"],
+                "ocean_ppl": metrics["ocean"]["perplexity"],
+                "generic_nll": metrics["generic"]["nll"],
+                "generic_ppl": metrics["generic"]["perplexity"],
+                "preference_accuracy": metrics["dpo"]["preference_accuracy"],
+                "preference_margin": metrics["dpo"]["preference_margin"],
+                "generation_tokens_per_second": metrics["generation_tokens_per_second"],
+            })
+    os.replace(temp, metrics_path)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

@@ -1,6 +1,6 @@
 # OceanHeart
 
-OceanHeart 是一个基于 [MiniMind](https://github.com/jingyaogong/minimind) 训练骨架的 63.9M 参数海洋领域文本语言模型实验项目。目标不是隐藏上游实现，而是完整复现并分析：通用预训练 → 海洋 SFT/LoRA → 海洋 DPO/GRPO。
+OceanHeart 是一个基于 [MiniMind](https://github.com/jingyaogong/minimind) 训练骨架的 63.9M 参数海洋领域文本语言模型实验项目。目标不是隐藏上游实现，而是完整复现并分析：通用预训练 → 海洋 SFT/LoRA → 海洋 DPO/GRPO → OPD/MOPD。
 
 旧版 Qwen2.5-7B + LLaMA-Factory LoRA 工程保存在 Git 标签 `legacy-llamafactory-v1`；当前版本只保留可复现的数据、训练、评估主链。
 
@@ -13,6 +13,7 @@ conda activate /home/anhuang/.conda/envs/minimind
 cd /home/anhuang/OceanHeart
 python scripts/prepare_ocean_data.py
 python scripts/prepare_ocean_grpo.py
+python scripts/prepare_opd_data.py
 ```
 
 数据处理会读取：
@@ -22,7 +23,7 @@ python scripts/prepare_ocean_grpo.py
 - `/home/anhuang/minimind/dataset/pretrain_t2t_mini.jsonl`
 - `/home/anhuang/minimind/dataset/sft_t2t_mini.jsonl`
 
-生成文件位于 `data/processed/`，不会提交到 Git。`manifest.json` 记录数据来源、许可、稳定切分、过滤数量、token 长度和截断率。Ocean 数据按规范化问题哈希做 80/10/10 切分，DPO 与 SFT 的相同问题始终进入同一集合。
+生成文件位于 `data/processed/`，不会提交到 Git。`manifest.json` 记录数据来源、许可、稳定切分、过滤数量、token 长度和截断率。Ocean 数据按规范化问题哈希做 80/10/10 切分，DPO 与 SFT 的相同问题始终进入同一集合。`opd_manifest.json` 另外记录 OPD/MOPD 的双域比例、文件哈希和 prompt 泄漏检查。
 
 ## Dense 与 MoE 权重规则
 
@@ -33,7 +34,7 @@ python scripts/prepare_ocean_grpo.py
 | Pretrain 输出 | `--save_weight pretrain` | `../out/pretrain_768.pth` | `../out/pretrain_768_moe.pth` |
 | SFT 输入 | `--from_weight pretrain` | `../out/pretrain_768.pth` | `../out/pretrain_768_moe.pth` |
 | SFT 输出 | `--save_weight ocean_sft_replay` | `../out/ocean_sft_replay_768.pth` | `../out/ocean_sft_replay_768_moe.pth` |
-| DPO/GRPO 输入 | `--from_weight ocean_sft_replay` | `../out/ocean_sft_replay_768.pth` | `../out/ocean_sft_replay_768_moe.pth` |
+| DPO/GRPO/OPD 输入 | `--from_weight ocean_sft_replay` | `../out/ocean_sft_replay_768.pth` | `../out/ocean_sft_replay_768_moe.pth` |
 
 因此 Dense 和 MoE 会自动分开加载、保存，不会互相覆盖。架构必须贯穿整条链路：MoE SFT 必须增加 `--use_moe 1`，并从 MoE Pretrain 权重开始；后续 MoE DPO/GRPO 同理。训练 checkpoint 另存于 `../checkpoints/`，并带相同的 `_moe` 后缀和 `_resume` 续训后缀。
 
@@ -61,7 +62,7 @@ torchrun --standalone --nproc_per_node=4 train_dpo.py \
   --use_swanlab --swanlab_mode offline --run_name smoke-dpo
 ```
 
-续训检查：先用 `--max_steps 10` 运行，再用相同参数加 `--from_resume 1 --max_steps 20`；同一个 SwanLab run 应从第 11 个 optimizer step 继续。
+续训检查：先用 `--max_steps 10` 运行，再用相同参数加 `--from_resume 1 --max_steps 20`，训练应从第 11 个 optimizer step 继续。SwanLab cloud 模式会复用同一 run ID；当前 SwanLab 0.6.8 不支持 offline run 原地 resume，因此 offline 会创建新 run，并在 config 的 `resumed_from_swanlab_id` 中记录前一个 ID。
 
 ## 完整实验
 
@@ -221,19 +222,114 @@ torchrun --standalone --nproc_per_node=4 train_grpo.py \
 
 MoE GRPO 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--run_name ocean-grpo-moe`；它会自动加载 `ocean_sft_replay_768_moe.pth`。由于 policy、reference 和 rollout 同时占用显存，2080 Ti 上先将 `--max_steps` 设为 2 做烟测，再决定是否长跑。
 
+### 6. Kimi-style OPD / MOPD
+
+这里依据 [Kimi K3](https://arxiv.org/abs/2607.24653) 和 [Thinking Machines OPD](https://thinkingmachines.ai/blog/on-policy-distillation/) 复现 OPD/MOPD 的核心机制，不是 Kimi K3 的九专家训练规模。学生先自己采样回答，教师只对学生实际访问的 token 计算概率：
+
+```text
+token reward = clip(teacher_logp - old_student_logp, -5, 5)
+policy loss  = PPO-clip(new_student_logp, old_student_logp, token reward)
+```
+
+海洋教师使用 Ocean DPO，通用教师使用本地 MiniMind Full SFT。两者都与学生共享 MiniMind Tokenizer，因此可以逐 token 对齐。SiliconFlow 和 Qwen 的 Tokenizer 不同，且普通 Chat API 不返回指定序列的逐 token logprob，所以只用于训练后的回答评审，不能替代这里的 OPD 教师。
+
+数据固定为 1600 条海洋训练 prompt、400 条通用训练 prompt；MOPD 使用相同样本按 80/20 混合。先分别训练两个单域 OPD，再训练统一 MOPD，才能量化多教师合并造成的 integration gap。
+
+#### Dense
+
+```bash
+cd /home/anhuang/OceanHeart/trainer
+
+torchrun --standalone --nproc_per_node=4 train_opd.py \
+  --domain ocean --teacher_path ../out/ocean_dpo_768.pth \
+  --from_weight ocean_sft_replay --save_weight ocean_opd \
+  --data_path ../data/processed/ocean_opd_train.jsonl \
+  --val_data_path ../data/processed/ocean_opd_val.jsonl \
+  --epochs 2 --dtype float16 --batch_size 1 --accumulation_steps 4 \
+  --max_seq_len 768 --max_gen_len 256 --learning_rate 3e-7 \
+  --reward_clip 5 --epsilon 0.2 \
+  --use_swanlab --swanlab_project OceanHeart-OPD --run_name ocean-opd
+
+torchrun --standalone --nproc_per_node=4 train_opd.py \
+  --domain general --teacher_path /home/anhuang/minimind/out/full_sft_768.pth \
+  --from_weight ocean_sft_replay --save_weight general_opd \
+  --data_path ../data/processed/general_opd_train.jsonl \
+  --val_data_path ../data/processed/general_opd_val.jsonl \
+  --epochs 2 --dtype float16 --batch_size 1 --accumulation_steps 4 \
+  --max_seq_len 768 --max_gen_len 256 --learning_rate 3e-7 \
+  --reward_clip 5 --epsilon 0.2 \
+  --use_swanlab --swanlab_project OceanHeart-OPD --run_name general-opd
+
+torchrun --standalone --nproc_per_node=4 train_mopd.py \
+  --ocean_teacher_path ../out/ocean_dpo_768.pth \
+  --general_teacher_path /home/anhuang/minimind/out/full_sft_768.pth \
+  --from_weight ocean_sft_replay --save_weight ocean_mopd \
+  --data_path ../data/processed/ocean_mopd_train.jsonl \
+  --val_data_path ../data/processed/ocean_mopd_val.jsonl \
+  --epochs 2 --dtype float16 --batch_size 1 --accumulation_steps 4 \
+  --max_seq_len 768 --max_gen_len 256 --learning_rate 3e-7 \
+  --reward_clip 5 --epsilon 0.2 \
+  --use_swanlab --swanlab_project OceanHeart-MOPD --run_name ocean-mopd
+```
+
+#### MoE
+
+MoE 使用相同数据和参数，学生权重会自动添加 `_moe` 后缀；教师是显式路径，因此必须切换为 MoE 权重：
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_opd.py \
+  --use_moe 1 --domain ocean --teacher_path ../out/ocean_dpo_768_moe.pth \
+  --from_weight ocean_sft_replay --save_weight ocean_opd \
+  --data_path ../data/processed/ocean_opd_train.jsonl \
+  --val_data_path ../data/processed/ocean_opd_val.jsonl \
+  --epochs 2 --batch_size 1 --accumulation_steps 4 \
+  --use_swanlab --swanlab_project OceanHeart-OPD --run_name ocean-opd-moe
+
+torchrun --standalone --nproc_per_node=4 train_opd.py \
+  --use_moe 1 --domain general \
+  --teacher_path /home/anhuang/minimind/out/full_sft_moe_768_moe.pth \
+  --from_weight ocean_sft_replay --save_weight general_opd \
+  --data_path ../data/processed/general_opd_train.jsonl \
+  --val_data_path ../data/processed/general_opd_val.jsonl \
+  --epochs 2 --batch_size 1 --accumulation_steps 4 \
+  --use_swanlab --swanlab_project OceanHeart-OPD --run_name general-opd-moe
+
+torchrun --standalone --nproc_per_node=4 train_mopd.py \
+  --use_moe 1 --ocean_teacher_path ../out/ocean_dpo_768_moe.pth \
+  --general_teacher_path /home/anhuang/minimind/out/full_sft_moe_768_moe.pth \
+  --from_weight ocean_sft_replay --save_weight ocean_mopd \
+  --data_path ../data/processed/ocean_mopd_train.jsonl \
+  --val_data_path ../data/processed/ocean_mopd_val.jsonl \
+  --epochs 2 --batch_size 1 --accumulation_steps 4 \
+  --use_swanlab --swanlab_project OceanHeart-MOPD --run_name ocean-mopd-moe
+```
+
+烟测在任一命令末尾增加 `--max_steps 20 --eval_interval 10 --save_interval 10 --swanlab_mode offline`。MoE 先用 `--max_steps 2` 确认显存；不要在当前 MoE 任务运行时启动。
+
+| SwanLab 曲线 | 主要含义 |
+|---|---|
+| `reverse_kl` | 学生与对应教师的差距，应总体下降 |
+| `reward_clip_fraction` | 持续偏高表示师生差距过大或 clip 过小 |
+| `ocean/token_share`、`general/token_share` | 应接近 0.8/0.2，明显漂移会影响 MOPD 结论 |
+| val 分域 `reverse_kl` | 判断统一模型在哪个领域出现 integration gap |
+
+首版不实现 [Open-MOPD](https://arxiv.org/abs/2608.19098) 的动态 token budget、gap-aware allocation 和 reward refresh。先观察 token share 与 integration gap；只有确实出现领域失衡时再增加这些机制。
+
 ## 离线评估
 
 ```bash
 cd /home/anhuang/OceanHeart
 python eval_ocean.py
+python eval_ocean.py --use-moe 1 --output-dir artifacts/eval_moe
 ```
 
-结果写入 `artifacts/eval/summary.json`、`generations.jsonl` 和 `generations.csv`，默认比较 Pretrain、合并 LoRA、纯/回放 SFT、DPO、GRPO，包括 Ocean/Generic NLL 与 PPL、DPO 偏好准确率和 margin、固定问题的确定性回答及吞吐。
+结果写入 `artifacts/eval/summary.json`、`metrics.csv`、`generations.jsonl` 和 `generations.csv`，默认比较 Pretrain、合并 LoRA、纯/回放 SFT、DPO、GRPO、两个单域 OPD 与 MOPD，包括 Ocean/Generic NLL 与 PPL、DPO 偏好准确率和 margin、固定问题的确定性回答及吞吐。三个 OPD 权重齐全时还会输出 MOPD 相对两个单域参照的 80/20 加权 integration gap。
 
 可选开启 SiliconFlow 裁判：
 
 ```bash
-SILICONFLOW_API_KEY=... python eval_ocean.py --judge siliconflow
+SILICONFLOW_API_KEY=... python eval_ocean.py --judge siliconflow \
+  --judge-baseline ocean_sft_replay --judge-candidates ocean_opd ocean_mopd
 ```
 
 没有密钥时只跳过 Judge，不影响离线指标。实验结论填写到 [EXPERIMENTS.md](EXPERIMENTS.md)。

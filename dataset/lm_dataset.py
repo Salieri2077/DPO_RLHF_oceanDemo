@@ -222,7 +222,8 @@ class RLAIFDataset(Dataset):
         return {
             'prompt': prompt,
             'question': next(message['content'] for message in reversed(sample['conversations']) if message['role'] == 'user'),
-            'answer': sample['conversations'][-1]['content']
+            'answer': sample['conversations'][-1]['content'],
+            'domain': sample.get('domain', 'ocean'),
         }
 
 class AgentRLDataset(Dataset):
