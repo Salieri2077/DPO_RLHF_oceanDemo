@@ -37,7 +37,7 @@
 - 泛化与遗忘：等待完整 A/B 训练后填写 Ocean/Generic PPL 变化。
 - DPO 行为变化：等待完整训练后填写 accuracy 与 reward margin。
 - LoRA 烟测：Dense 4 卡先跑 10 optimizer steps，再从 checkpoint 续到 20；val loss `3.0683 → 2.9149`，PPL `21.51 → 18.45`。adapter 为 0.393M 参数（Dense 0.61%，MoE 0.20%），adapter/merged/resume 三类权重均成功保存。
-- GRPO 烟测：CPU 已覆盖原生 rollout→policy backward、GRPO clip/KL、Ocean 分组 Judge 严格 JSON 与重试、微型 MoE backward。Codex 进程未继承终端中的 `SILICONFLOW_API_KEY`，因此未擅自发起付费 20-step 在线裁判训练。
+- GRPO 烟测：CPU 已覆盖原生 rollout→policy backward、GRPO clip/KL、Ocean 分组 Judge 严格 JSON 与重试、微型 MoE backward。真实 API 暴露了 Qwen2.5-7B 的残缺/越界评分，改用 Qwen3-8B JSON mode 后，四卡 `S768+G256` 2-step 烟测通过（loss `0.0024 → 0.0000`，reward `-1.588 → -0.102`），checkpoint 与 SwanLab offline 正常。
 - OPD/MOPD 烟测：两卡微型 Dense 完成 1→2 step checkpoint 续训，两卡 MOPD Dense/MoE 均完成 2 steps、分域指标聚合和唯一 rank-0 SwanLab offline 写入；教师 checkpoint 结构与哈希均写入续训文件。SwanLab 0.6.8 的 offline 模式不支持原 run resume，第二段 run 通过 `resumed_from_swanlab_id` 关联；cloud 模式复用原 ID。
 - OPD/MOPD 评估：三个微型 checkpoint 已走通 Ocean/Generic NLL/PPL、DPO 偏好指标、确定性生成、CSV 和 80/20 integration gap 输出；微型随机权重数值只用于验证管线，不作为效果结论。
 - 下一轮只改变的变量：先完成 768-token A/B 基线；随后按规则只把 SFT 改为 seq 1024、每卡 batch 1、累积 32，比较截断改善。

@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument("--val_data_path", default="../data/processed/ocean_grpo_val.jsonl")
     parser.add_argument("--from_weight", default="ocean_sft_replay")
     parser.add_argument("--from_resume", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--reward_model", default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--reward_model", default="Qwen/Qwen3-8B")
     parser.add_argument("--use_swanlab", "--use_wandb", dest="use_swanlab", action="store_true")
     parser.add_argument("--swanlab_mode", "--wandb_mode", dest="swanlab_mode", choices=["cloud", "local", "offline", "disabled"], default="cloud")
     parser.add_argument("--swanlab_logdir", "--wandb_logdir", dest="swanlab_logdir", default=None)

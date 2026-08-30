@@ -319,6 +319,8 @@ def parse_reward_group(content, expected):
     if content.startswith("```"):
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.I)
     scores = json.loads(content)
+    if isinstance(scores, dict):
+        scores = scores.get("scores")
     if not isinstance(scores, list) or len(scores) != expected:
         raise ValueError(f"expected {expected} scores, got {len(scores) if isinstance(scores, list) else 'non-list'}")
     scores = [float(score) for score in scores]
@@ -328,14 +330,14 @@ def parse_reward_group(content, expected):
 
 
 class SiliconFlowRewardModel:
-    def __init__(self, api_key, model="Qwen/Qwen2.5-7B-Instruct"):
+    def __init__(self, api_key, model="Qwen/Qwen3-8B"):
         if not api_key:
             raise ValueError("SILICONFLOW_API_KEY is required")
         self.api_key = api_key
         self.model = model
 
     def _request(self, user_content, max_tokens=128):
-        payload = json.dumps({
+        body = {
             "model": self.model,
             "messages": [
                 {
@@ -345,21 +347,25 @@ class SiliconFlowRewardModel:
                 {"role": "user", "content": user_content}
             ],
             "temperature": 0,
-            "max_tokens": max_tokens
-        }).encode()
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.model.startswith("Qwen/Qwen3"):
+            body["enable_thinking"] = False
+        payload = json.dumps(body).encode()
         request = urllib.request.Request(
             "https://api.siliconflow.cn/v1/chat/completions",
             data=payload,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=60) as result:
-            return json.load(result)["choices"][0]["message"]["content"]
+            return json.loads(result.read(), strict=False)["choices"][0]["message"]["content"]
 
     def score_group(self, question, reference, responses):
         candidates = "\n".join(f"候选{i + 1}: {response}" for i, response in enumerate(responses))
         prompt = (
             f"问题：{question}\n参考答案：{reference}\n{candidates}\n"
-            f"请返回长度为{len(responses)}的JSON数字数组，各分数必须在-3到3之间。"
+            f"请只返回 {{\"scores\": [分数...]}}，scores长度必须为{len(responses)}，各分数必须在-3到3之间。"
         )
         for attempt in range(3):
             try:
