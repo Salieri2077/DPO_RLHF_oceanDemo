@@ -174,6 +174,14 @@ torchrun --standalone --nproc_per_node=4 train_dpo.py \
 ```
 
 MoE DPO 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--run_name ocean-dpo-moe`；它会自动加载 `ocean_sft_replay_768_moe.pth` 并保存 `ocean_dpo_768_moe.pth`。
+```bash
+torchrun --standalone --nproc_per_node=4 train_dpo.py \
+  --use_moe 1 --from_weight ocean_sft_replay --save_weight ocean_dpo \
+  --epochs 2 --dtype float16 --batch_size 1 --accumulation_steps 4 \
+  --max_seq_len 1024 --learning_rate 4e-8 --beta 0.15 \
+  --use_swanlab --swanlab_project OceanHeart-DPO --run_name ocean-dpo-moe
+```
+
 
 ### 4. 海洋 LoRA 对照
 
