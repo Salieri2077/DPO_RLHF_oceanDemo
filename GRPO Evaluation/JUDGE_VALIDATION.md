@@ -35,3 +35,25 @@
 python "GRPO Evaluation/validate_judge.py" --model Qwen/Qwen2.5-72B-Instruct --output "GRPO Evaluation/results/judge72b_gate.json"
 python "GRPO Evaluation/validate_judge.py" --model deepseek-ai/DeepSeek-V3 --output "GRPO Evaluation/results/judge_v3_gate.json"
 ```
+
+## 用户接受偏差后的训练决策（2026-09-22）
+
+用户明确接受本次已观察到的1分偏差，指定 DeepSeek-V3 用于新一轮 GRPO。验收报告仍保留失败结果，不改动0.5分门槛。先启动 Dense，MoE 待后续启动；均从各自 SFT replay 起点重新训练，而非续接旧 GRPO。
+
+Dense 命令（在 trainer 目录、minimind 环境运行，密钥由环境继承）：
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_grpo.py \
+  --from_weight ocean_sft_replay --from_resume 0 --use_moe 0 \
+  --save_weight ocean_grpo_deepseekv3_eval50 \
+  --data_path ../data/processed/ocean_grpo_train.jsonl \
+  --val_data_path ../data/processed/ocean_grpo_val.jsonl \
+  --epochs 1 --dtype float16 --batch_size 1 --accumulation_steps 1 \
+  --max_seq_len 768 --max_gen_len 256 --num_generations 4 \
+  --learning_rate 3e-7 --beta 0.1 --epsilon 0.2 --max_steps 100 \
+  --eval_interval 10 --eval_batches 50 --reward_model deepseek-ai/DeepSeek-V3 \
+  --use_swanlab --swanlab_mode cloud --swanlab_project OceanHeart-GRPO \
+  --run_name ocean-grpo-dense-deepseekv3-100steps-eval50
+```
+
+裁判和提示词均与旧8B实验不同，reward绝对值不能直接作为模型能力提升量；训练后须用统一裁判配对评估。
