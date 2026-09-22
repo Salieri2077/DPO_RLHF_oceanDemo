@@ -61,6 +61,9 @@ class GRPOTest(unittest.TestCase):
             body = json.loads(request.data)
             self.assertEqual(body["response_format"], {"type": "json_object"})
             self.assertFalse(body["enable_thinking"])
+            self.assertEqual(body["model"], "Qwen/Qwen3-32B")
+            self.assertIn("完全相同的答案必须同分", body["messages"][0]["content"])
+            self.assertEqual(json.loads(body["messages"][1]["content"].split("\n", 1)[1])["candidates"], ["a", "b"])
             return response
         with patch("trainer.trainer_utils.urllib.request.urlopen", side_effect=fake_urlopen):
             self.assertEqual(judge.score_group("海浪是什么？", "参考", ["a", "b"]), [1.0, 2.0])

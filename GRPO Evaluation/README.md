@@ -20,7 +20,15 @@ export SILICONFLOW_API_KEY="你的密钥"
 - `summary.json`：协议、哈希、平均分、胜率与置信区间；
 - `comparison.md`：简要结论。
 
-当前 judge 与 GRPO 训练时的奖励模型同为 `Qwen/Qwen3-8B`，因此结果衡量的是对该 judge 的提升，不能替代独立模型裁判或人工盲评。
+历史50题结果使用 `Qwen/Qwen3-8B`。当前默认升级为 `Qwen/Qwen3-32B` 并使用明确评分锚点；新旧分数不可直接混合比较。与训练共享裁判仍不能替代独立裁判或人工盲评。
+
+训练前运行真实 API 验收（24次请求）：
+
+```bash
+/home/anhuang/.conda/envs/minimind/bin/python "GRPO Evaluation/validate_judge.py"
+```
+
+验收包含4组历史重复答案、相同正确答案、4候选好坏排序，每组正反序各重复两次。相同答案必须同分，近似低质答案均不高于-2且分差不超过0.5，换序分差不超过0.5，好答案至少2分。原始评分写入 `results/judge32b_gate.json`；任何检查失败时返回非零退出码，不启动训练。通过仅代表这些用例通过，不代表所有领域评分都可靠。
 
 运行单元测试：
 

@@ -202,7 +202,7 @@ MoE LoRA 使用同一命令，增加 `--use_moe 1`，并把 run name 改为 `--r
 
 ### 5. 海洋 GRPO（首轮 20 steps）
 
-GRPO 默认从 Dense `ocean_sft_replay` 开始。奖励由 SiliconFlow `Qwen/Qwen3-8B` 海洋领域裁判给出：每个问题把参考答案和 4 个候选合并为一次 JSON-mode 请求，再叠加小幅长度奖励与三元组重复惩罚。训练过程不会保存或记录 API Key；API 连续三次失败或返回非法分数会直接停止，避免用伪造的零奖励污染实验。
+GRPO 默认从 Dense `ocean_sft_replay` 开始。当前奖励裁判默认升级为 SiliconFlow `Qwen/Qwen3-32B`（历史实验为8B），采用明确评分锚点：每个问题把参考答案和4个候选合并为一次 JSON-mode 请求，再叠加小幅长度奖励与三元组重复惩罚。训练前须运行 `GRPO Evaluation/validate_judge.py` 的实际API验收；详情见该目录说明。训练过程不会保存或记录 API Key；API 连续三次失败或返回非法分数会直接停止，避免用伪造的零奖励污染实验。
 
 ```bash
 # 只在自己的终端设置新密钥，不要写入脚本或提交到 Git

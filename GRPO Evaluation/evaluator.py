@@ -181,7 +181,7 @@ def parse_args():
     parser.add_argument("--max-seq-len", type=int, default=768)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--judge", choices=["none", "siliconflow"], default="siliconflow")
-    parser.add_argument("--judge-model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--judge-model", default="Qwen/Qwen3-32B")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-repeats", type=int, default=2000)
