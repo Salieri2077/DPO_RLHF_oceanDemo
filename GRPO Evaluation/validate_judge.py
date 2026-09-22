@@ -12,8 +12,9 @@ from trainer.trainer_utils import OCEAN_JUDGE_PROMPT, SiliconFlowRewardModel
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--output', type=Path, default=Path(__file__).parent / 'results/judge32b_gate.json')
+    parser.add_argument('--model', default='Qwen/Qwen3-32B')
     args = parser.parse_args()
-    judge = SiliconFlowRewardModel(os.environ['SILICONFLOW_API_KEY'])
+    judge = SiliconFlowRewardModel(os.environ['SILICONFLOW_API_KEY'], args.model)
     source = ROOT / 'GRPO Evaluation/results/moe/generations_and_scores.jsonl'
     rows = [json.loads(line) for line in source.read_text().splitlines()]
     cases = []

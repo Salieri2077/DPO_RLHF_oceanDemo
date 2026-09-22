@@ -14,3 +14,24 @@
 门槛在实测前固定：换序分差不超过0.5。最后一组有1分偏差，因此总验收失败。没有启动新GRPO训练，没有修改原始分数让测试通过。
 
 旧的严重评分翻转在这些回归用例中已消失，但32B仍存在位置偏差。需要进一步改进评分协议或更换裁判，再完整重跑验收。候选模型的通过用例不能证明全域可靠性，也不能证明训练会获得收益。
+
+## 同提示词扩大裁判模型复测
+
+新增 `--model` 参数，允许显式选择模型而不改变训练默认值。通过账户 `/v1/models` 核实模型标识；以下两款各完成24次真实评分，原有0.5分容差不变。
+
+| API 模型 | 通过的用例轮次（共12轮） | 最大换序分差 | 验收 |
+|---|---:|---:|---|
+| Qwen/Qwen3-32B（此前基线） | 10 | 1.0 | 失败 |
+| Qwen/Qwen2.5-72B-Instruct | 10 | 1.0 | 失败 |
+| deepseek-ai/DeepSeek-V3 | 8 | 1.0 | 失败 |
+
+72B四候选用例中，好答案从3分变为2分，第二轮重复废话从-2变为-3。DeepSeek-V3对历史id 0的同一候选换序后从-3变为-2，四候选用例也出现1分换序差异。所有模型的完全相同正确答案均获[3,3]。
+
+原始报告：`results/judge72b_gate.json`、`results/judge_v3_gate.json`，包含候选、每轮正反序分数、提示词全文及哈希。结果支持“本次换用更大模型未消除位置偏差”，不支持“参数量没有价值”的一般结论，因为模型代际、架构也同时改变。没有启动训练或将未通过的新模型设为默认。
+
+复现示例：
+
+```bash
+python "GRPO Evaluation/validate_judge.py" --model Qwen/Qwen2.5-72B-Instruct --output "GRPO Evaluation/results/judge72b_gate.json"
+python "GRPO Evaluation/validate_judge.py" --model deepseek-ai/DeepSeek-V3 --output "GRPO Evaluation/results/judge_v3_gate.json"
+```
