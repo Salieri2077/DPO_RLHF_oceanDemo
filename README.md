@@ -4,6 +4,8 @@ OceanHeart 是一个基于 [MiniMind](https://github.com/jingyaogong/minimind) �
 
 旧版 Qwen2.5-7B + LLaMA-Factory LoRA 工程保存在 Git 标签 `legacy-llamafactory-v1`；当前版本只保留可复现的数据、训练、评估主链。
 
+新增独立的 [Dense 海洋工具 Agent 实验](<Agent Evaluation/README.md>)：真实本地检索／海洋计算、工具 SFT 冷启动、多轮 GRPO 与有门槛的四卡训练，不改变原有问答训练流程。
+
 ## 环境与数据
 
 使用已经验证的本地环境：
