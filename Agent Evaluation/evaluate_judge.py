@@ -15,6 +15,10 @@ from trainer.train_agent import atomic_json
 from trainer.trainer_utils import SiliconFlowRewardModel
 
 
+def candidate_text(trace):
+    return trace["final"] or (trace["rounds"][-1]["text"] if trace["rounds"] else "")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--traces", type=Path, required=True)
@@ -32,9 +36,13 @@ def main():
             if args.deadline and time.time() >= args.deadline:
                 break
             trace = traces[task_id]
-            row = {"id": task_id, "question": task["question"], "answer": trace["final"], "reference": task["answer"]}
+            # A length-limited rollout has no final answer but does have an actual
+            # generated response. Audit that response instead of silently grading "".
+            answer = candidate_text(trace)
+            row = {"id": task_id, "question": task["question"], "answer": answer,
+                   "stop": trace["stop"], "reference": task["answer"]}
             try:
-                row["score"] = judge.score_group(task["question"], task["answer"], [trace["final"]])[0]
+                row["score"] = judge.score_group(task["question"], task["answer"], [answer])[0]
             except Exception as exc:
                 row["error"] = type(exc).__name__
             rows.append(row)
@@ -42,6 +50,7 @@ def main():
     scores = [r["score"] for r in rows if "score" in r]
     atomic_json(args.output, {"status": "completed" if len(scores) == 20 else "partial" if key else "skipped_missing_key",
                              "model": "deepseek-ai/DeepSeek-V3", "trace_sha256": file_hash(args.traces),
+                             "answer_selection": "final_or_last_partial",
                              "requested_questions": 20, "scored": len(scores), "errors": sum("error" in r for r in rows),
                              "score_mean": sum(scores) / len(scores) if scores else None,
                              "warning": "Auxiliary semantic audit only; not the rule reward or proof of scientific correctness."})

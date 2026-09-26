@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import math
 import unittest
 from pathlib import Path
@@ -111,6 +112,14 @@ class AgentTest(unittest.TestCase):
         self.assertNotIn("<tool_response>", text)
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()))
         self.assertFalse(aggregate([trace])["gate_pass"])  # one sample has no group signal
+
+    def test_judge_sees_partial_generation(self):
+        spec = importlib.util.spec_from_file_location("agent_judge", ROOT / "Agent Evaluation/evaluate_judge.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.candidate_text({"final": "", "rounds": [{"text": "unfinished response"}]}), "unfinished response")
+        self.assertEqual(module.candidate_text({"final": "answer", "rounds": [{"text": "tool call"}]}), "answer")
+        self.assertEqual(module.candidate_text({"final": "", "rounds": []}), "")
 
 
 if __name__ == "__main__":
