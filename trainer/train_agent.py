@@ -337,6 +337,10 @@ def main():
                     scaler.scale(loss / accumulation).backward()
                 window.add("loss", loss, int((labels[:, 1:] != -100).sum()))
             else:
+                # Even a rank with only context-limited (zero-action) trajectories
+                # must reduce exactly the same metric keys as the other ranks.
+                for key in ("policy_loss", "kl", "grpo_loss", "clip_fraction"):
+                    window.add(key, 0., 0.)
                 raw.eval()
                 generator = model_generator(raw, tokenizer, args.device)
                 task = train_tasks[index]
