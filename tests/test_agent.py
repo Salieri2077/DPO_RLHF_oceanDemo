@@ -10,7 +10,7 @@ from agent.ocean import (OceanTools, calculate, demonstration, numeric_answer, o
                          parse_call, read_jsonl, run_trajectory)
 from dataset.lm_dataset import SFTDataset
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
-from trainer.train_agent import aggregate, round_logps
+from trainer.train_agent import AgentSFTDataset, aggregate, round_logps
 from trainer.train_grpo import grpo_objective
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,12 +104,18 @@ class AgentTest(unittest.TestCase):
             self.assertTrue(math.isfinite(loss.item()))
             loss.backward()
             self.assertGreater(new.grad.abs().sum().item(), 0)
-        ds = SFTDataset(ROOT / "data/processed/ocean_agent_sft_train.jsonl", self.tokenizer, 2048, deterministic=True)
+        ds = AgentSFTDataset(ROOT / "data/processed/ocean_agent_sft_train.jsonl", self.tokenizer, 2048, deterministic=True)
         index = self.tasks.index(task)
         ids, labels = ds[index]
         text = self.tokenizer.decode(ids[labels != -100])
         self.assertIn("marine_calculate", text)
         self.assertNotIn("<tool_response>", text)
+        # Every real rollout prefix must be the same token sequence seen in SFT.
+        # In particular, dropping the empty think block shifts tool-call openings.
+        for round_ in trace["rounds"]:
+            prefix = round_["input_ids"]
+            self.assertEqual(ids[:len(prefix)].tolist(), prefix)
+            self.assertEqual(labels[len(prefix)].item(), round_["completion_ids"][0])
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters()))
         self.assertFalse(aggregate([trace])["gate_pass"])  # one sample has no group signal
 

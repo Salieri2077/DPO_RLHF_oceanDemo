@@ -11,12 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from trainer.train_agent import atomic_json
+from agent.ocean import file_hash
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--hours", type=float, default=10.)
+    parser.add_argument("--reuse_preflight", help="Reuse unchanged baseline/initial diagnosis after an implementation fix; preserves the original deadline")
     args = parser.parse_args()
     if Path(args.tag).name != args.tag or args.hours <= 0:
         raise ValueError("invalid tag / budget")
@@ -25,8 +27,18 @@ def main():
         raise FileExistsError(f"Do not overwrite an existing experiment: {base}")
     base.mkdir(parents=True)
     deadline = time.time() + args.hours * 3600
+    prior = None
+    if args.reuse_preflight:
+        if Path(args.reuse_preflight).name != args.reuse_preflight:
+            raise ValueError("invalid preflight tag")
+        prior = json.loads((ROOT / "artifacts/agent" / args.reuse_preflight / "status.json").read_text())
+        if prior["phase"] not in {"stopped_gate_failed", "failed"}:
+            raise ValueError("Can only reuse preflight from a stopped experiment")
+        deadline = min(deadline, prior["deadline"])
     train_deadline = deadline - 1800
     state = {"tag": args.tag, "started_at": time.time(), "deadline": deadline, "stages": [], "phase": "starting"}
+    if prior:
+        state.update(started_at=prior["started_at"], reused_preflight=args.reuse_preflight)
     environment = dict(os.environ, OMP_NUM_THREADS="2", PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false")
     current_weight = "ocean_grpo_deepseekv3_eval50"
 
@@ -61,13 +73,33 @@ def main():
             atomic_json(base / f"judge_{stage}.json", {"status": "failed", "returncode": result.returncode})
 
     try:
-        baseline = run("baseline", "eval", current_weight)
-        judge(baseline / "result.jsonl", "baseline")
-        diagnostic = run("diagnose-initial", "diagnose", current_weight)
+        if prior:
+            baseline = ROOT / "artifacts/agent" / (args.reuse_preflight + "-baseline")
+            diagnostic = ROOT / "artifacts/agent" / (args.reuse_preflight + "-diagnose-initial")
+            for directory in (baseline, diagnostic):
+                config = json.loads((directory / "config.json").read_text())
+                for key, path in (("input_weight_sha256", ROOT / "out" / (current_weight + "_768.pth")),
+                                  ("tool_sha256", ROOT / "agent/ocean.py"), ("data_manifest_sha256", ROOT / "data/processed/agent_manifest.json")):
+                    if config[key] != file_hash(path):
+                        raise ValueError(f"Cannot reuse changed preflight: {key}")
+            state["baseline_traces"] = str(baseline / "result.jsonl")
+            audit = ROOT / "artifacts/agent" / args.reuse_preflight / "judge_baseline_actual.json"
+            if audit.exists() and json.loads(audit.read_text()).get("answer_selection") == "final_or_last_partial":
+                state["baseline_judge"] = str(audit)
+            else:
+                judge(baseline / "result.jsonl", "baseline")
+                state["baseline_judge"] = str(base / "judge_baseline.json")
+        else:
+            baseline = run("baseline", "eval", current_weight)
+            judge(baseline / "result.jsonl", "baseline")
+            diagnostic = run("diagnose-initial", "diagnose", current_weight)
         gate = json.loads((diagnostic / "result.json").read_text())
         if not gate["gate_pass"]:
+            sft_budget = 3600 - sum(s["seconds"] for s in (prior or {}).get("stages", []) if s["stage"] == "sft")
+            if sft_budget <= 0:
+                raise RuntimeError("Tool SFT budget already exhausted")
             warmup = run("sft", "sft", current_weight, ["--epochs", 3, "--max_steps", 200,
-                         "--max_train_seconds", 3600, "--accumulation_steps", 8, "--learning_rate", "1e-5", "--eval_interval", 200])
+                         "--max_train_seconds", sft_budget, "--accumulation_steps", 8, "--learning_rate", "1e-5", "--eval_interval", 200])
             current_weight = "ocean_agent_" + args.tag + "-sft"
             diagnostic = run("diagnose-sft", "diagnose", current_weight)
             gate = json.loads((diagnostic / "result.json").read_text())
@@ -77,6 +109,7 @@ def main():
             state["phase"] = "stopped_gate_failed"
             atomic_json(base / "status.json", state)
             print("STOP: tool SFT did not meet the agreed capability gate; no long GRPO launched.", flush=True)
+            judge(warmup / "val_final.jsonl", "final_sft_gate_failed")
             return
         smoke = run("grpo-smoke", "grpo", current_weight, ["--max_steps", 5, "--skip_eval", "--verify_sync", "--save_interval", 1])
         completion = json.loads((smoke / "completion.json").read_text())

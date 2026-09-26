@@ -29,6 +29,8 @@ OMP_NUM_THREADS=2 /home/anhuang/.conda/envs/minimind/bin/python scripts/run_ocea
 
 门槛失败就停止；通过后四卡 GRPO 烟测5步＋续训1步，核验梯度、参数哈希同步、保存和恢复；正式 GRPO 从通过诊断的起点重新开始，不继承烟测更新。模型和冻结 reference 均使用这个 RL 起点。
 
+Agent SFT 使用保留完整模板的独立数据适配器，不使用问答 SFT 的 thinking 清理。测试逐轮断言 SFT 前缀与 rollout 实际输入 tokens 相同。如修复实现问题后重跑，可用 `--reuse_preflight 旧tag` 复用哈希未变的原始基线与诊断；仍从原始 Dense 权重开始，保留旧失败产物，并继承原始十小时截止时间和剩余 SFT 预算。
+
 总预算包含原始能力检查、可选裁判评估、SFT、诊断和烟测。训练截止前预留30分钟保存与末尾评估。停止在 optimizer 边界，因此耗时是近似上限，而非强制 kill 的硬截止。显存不足、非有限梯度、SwanLab 写入异常或门槛失败均停止，不能自动放宽条件。数据、工具或关键训练参数变化时拒绝续训。
 
 ## 奖励与可解释性

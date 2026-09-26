@@ -32,6 +32,23 @@ from trainer.trainer_utils import (MetricWindow, experiment_config, init_distrib
                                    lm_checkpoint, reduce_sums, setup_seed)
 
 
+class AgentSFTDataset(SFTDataset):
+    """Preserve the exact inference template, including its empty thinking prefix.
+
+    The QA SFTDataset intentionally removes that prefix in deterministic mode;
+    that normalization must not be used for tool protocol supervision.
+    """
+    def __getitem__(self, index):
+        prompt = self.create_chat_prompt(self.samples[index]["conversations"])
+        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        if len(ids) > self.max_length:
+            raise ValueError("Agent demonstration exceeds context; regenerate data rather than truncate")
+        labels = self.generate_labels(ids)
+        padding = self.max_length - len(ids)
+        return (torch.tensor(ids + [self.tokenizer.pad_token_id] * padding, dtype=torch.long),
+                torch.tensor(labels + [-100] * padding, dtype=torch.long))
+
+
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +260,7 @@ def main():
         reference.to(args.device).eval().requires_grad_(False)
         dataset = train_tasks
     else:
-        dataset = SFTDataset(args.data_dir / "ocean_agent_sft_train.jsonl", tokenizer, args.max_total_len, deterministic=True)
+        dataset = AgentSFTDataset(args.data_dir / "ocean_agent_sft_train.jsonl", tokenizer, args.max_total_len, deterministic=True)
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=42)
     optimizer = torch.optim.AdamW(raw.parameters(), lr=args.learning_rate)
     scaler = torch.amp.GradScaler("cuda", init_scale=1024., enabled=args.device.type == "cuda")
