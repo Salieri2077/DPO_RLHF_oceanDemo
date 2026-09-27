@@ -14,6 +14,20 @@ ROOT = Path(__file__).resolve().parents[1]
 CALL = '<tool_call>{"name":"marine_calculate","arguments":{"operation":"distance","speed":12,"hours":3}}</tool_call>'
 
 
+class RuntimeSelectionTests(unittest.TestCase):
+    def test_defaults_legacy_and_rl_boundary(self):
+        from trainer.train_agent import parser, runtime_for
+        def select(*argv):
+            return runtime_for(parser().parse_args(['--run_name', 'test', *argv]))
+        for mode in ('sft', 'eval'):
+            self.assertEqual(select('--agent_version', 'v2', '--mode', mode), 'sdk')
+            self.assertEqual(select('--agent_version', 'v2', '--mode', mode, '--runtime', 'local'), 'local')
+        self.assertEqual(select(), 'local')
+        for argv in (('--runtime', 'sdk'), ('--agent_version', 'v2', '--mode', 'grpo')):
+            with self.assertRaises(ValueError):
+                select(*argv)
+
+
 @unittest.skipUnless(HAS_SDK, 'optional SDK environment required')
 class SDKTests(unittest.TestCase):
     @classmethod

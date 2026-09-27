@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the gated ReAct-v2 SFT experiment, then paired evaluation (never RL)."""
+"""Run tool SFT with the SDK runtime and paired evaluation (never RL)."""
 import argparse
 import csv
 import json
@@ -78,10 +78,12 @@ def main():
     args = p.parse_args()
     if Path(args.tag).name != args.tag:
         raise ValueError("tag must be a simple name")
+    import agent.sdk  # Use the SDK venv; fail before creating artifacts or starting GPUs.
     base = ROOT / "artifacts/agent" / args.tag
     base.mkdir(parents=True, exist_ok=False)
     state = {"phase": "starting", "stages": [], "started_at": time.time(), "rl_enabled": False,
-             "base_weight": BASE_WEIGHT, "data_manifest_sha256": file_hash(args.data_dir / "agent_manifest.json")}
+             "base_weight": BASE_WEIGHT, "runtime": "sdk",
+             "data_manifest_sha256": file_hash(args.data_dir / "agent_manifest.json")}
     records = {}
     environment = dict(os.environ, OMP_NUM_THREADS="2", PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false")
 
@@ -89,6 +91,7 @@ def main():
         name = args.tag + "-" + stage
         command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node=4",
                    str(ROOT / "trainer/train_agent.py"), "--agent_version", version, "--mode", mode,
+                   "--runtime", "sdk" if version == "v2" else "local",
                    "--from_weight", weight, "--save_weight", "ocean_" + name, "--run_name", name,
                    "--data_dir", str(data or args.data_dir), "--use_swanlab", "--swanlab_mode", "cloud", *map(str, extra)]
         state["phase"] = stage

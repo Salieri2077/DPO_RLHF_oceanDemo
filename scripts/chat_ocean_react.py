@@ -23,14 +23,15 @@ def main():
     p.add_argument("--question")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--resume", action="store_true")
-    p.add_argument("--runtime", choices=["local", "sdk"], default="local")
+    p.add_argument("--runtime", choices=["local", "sdk"], default="sdk",
+                   help="SDK by default; local is retained for legacy replay/resume")
     p.add_argument("--max_turns", type=int, default=6)
     p.add_argument("--max_calls", type=int, default=4)
     p.add_argument("--max_total_len", type=int, default=2048)
     p.add_argument("--max_new_tokens", type=int, default=192)
     args = p.parse_args()
     if args.runtime == "sdk" and args.resume:
-        p.error("SDK session resume is not implemented; start a new session")
+        p.error("SDK session resume is not implemented; use --runtime local for an old local session")
     runner = run
     if args.runtime == "sdk":
         from agent.sdk import run as runner

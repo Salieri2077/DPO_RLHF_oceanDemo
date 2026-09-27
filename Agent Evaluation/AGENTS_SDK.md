@@ -1,6 +1,6 @@
 # OceanHeart + OpenAI Agents SDK
 
-This optional runtime replaces the handwritten ReAct loop with `agents.Runner`.
+The default v2 runtime replaces the handwritten ReAct loop with `agents.Runner`.
 `agent/sdk.py` implements the SDK `Model` interface and registers the existing
 `search_ocean` and `marine_calculate` functions as SDK `FunctionTool`s. Inference
 still uses MiniMind locally; no OpenAI model, API key, server, or paid API is used.
@@ -17,6 +17,8 @@ From the repository root:
 
 The tested SDK is 0.22.3 (OpenAI client 3.19.2). Torch/Transformers are reused
 from MiniMind. The original environment's OpenAI 1.59.6 is not upgraded.
+Use this SDK environment for v2 commands. Legacy v1 keeps its local runtime;
+`--runtime local` explicitly selects the old v2 loop for historical replay.
 
 ## Run the local backbone
 
@@ -67,9 +69,14 @@ process that needs other agents' OpenAI tracing.
   retry limits match the existing harness; failures remain visible to the scorer.
 - Retrieval keeps the existing split-specific corpus, parameter validation and
   untrusted-document boundary. Tool code, scoring and SFT datasets are reused.
-- Trainer integration is **evaluation only** (`v2`); SDK SFT/GRPO/diagnose modes
-  are rejected. Existing SFT/GRPO defaults remain unchanged. SDK rollout-based RL
-  requires a separate sampling/weight-sync/probability verification step.
+- Trainer v2 **evaluation and SFT validation** now default to SDK. SFT's loss,
+  dataset, assistant-token masks, optimizer and checkpoints are unchanged: its
+  pre-training, periodic and final task evaluations use Runner. SDK GRPO/diagnose
+  are still rejected; legacy v1 GRPO remains local. SDK rollout-based RL requires
+  a separate sampling/weight-sync/probability verification step.
+- Resume requires the same runtime, SDK version and adapter hash. Legacy
+  checkpoints without a runtime are treated as local; pass `--runtime local` to
+  resume them. To change runtimes, start a separately named run from its weights.
 - One adapter per episode, synchronous CLI/worker entry. No concurrent reuse of
   one model/SQLite connection, no handoffs, hosted state, or structured-output API.
 
@@ -111,3 +118,37 @@ Official design references:
   `logs/agent_sdk_val50.log`, `logs/agent_sdk_local_val50.log`, `logs/agent_sdk_cli.log`.
 - No long training, cloud model calls, or SwanLab upload was started for this
   runtime acceptance check. Existing weights and datasets were not modified.
+
+## Default-runtime migration and the existing SFT experiment
+
+The old `ocean-react-dense` tmux pipeline was already **completed**, with an idle
+shell and no training subprocess. It performed 282 SFT updates over 3 epochs;
+the full pipeline, including evaluations, took about 21 minutes. Its output is
+preserved at `artifacts/agent/react-v2-20260927-1046/`. No active job was killed,
+no session was deleted, and no full training was restarted merely to change SDKs.
+
+SDK now owns the default v2 interactive and evaluation loops. The existing
+`scripts/run_ocean_react.py` pipeline also uses SDK for v2 SFT validation and
+paired evaluations; only its explicitly labeled legacy A/v1 baseline remains
+local. Run it with the SDK Python, a fresh tag, and only when another training
+experiment is actually wanted. Existing trained weights need no SDK conversion.
+
+工具 SFT 训练的是 **模型**，不是 SDK 或工具函数：学习何时检索、选择哪个工具、
+正确填写数值与单位、读取真实结果并回答。SDK 提供调度机制，不自带我们的
+OceanInstruct 分集合检索库或受限航程计算器。`search_ocean` 和 `marine_calculate`
+继续复用同一份实现，已注册为 SDK FunctionTool；不重复写业务工具，也不换成
+需要托管服务的通用搜索/代码执行工具。已有工具 SFT 数据与权重直接沿用。
+
+`agent/react.py` retains shared protocol/scoring/dataset code and the historical
+loop for regression tests/replay. The default SDK path does not call that loop.
+Keeping the shared file unchanged also preserves existing data manifest hashes.
+
+Default-switch checks: 31 tests pass in the SDK environment (original environment:
+27 pass, 4 optional skips). A two-GPU engineering-only SFT smoke completed one
+nonzero update, with parameter hashes synchronized. Both the initial and final
+150-question validations contain SDK runtime traces. Resume reached global step 2
+with synchronized parameters and finite nonzero gradients. Artifacts are isolated
+under `artifacts/agent/sdk-default-sft-{smoke,resume}-20260927/`, with
+`logs/agent_sdk_default_sft_{smoke,resume}.log`. SwanLab used **offline** mode for
+these short checks; this is not a new full experiment or a claimed quality gain.
+The saved production SFT checkpoint was not overwritten.

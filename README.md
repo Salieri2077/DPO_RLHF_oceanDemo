@@ -319,8 +319,8 @@ torchrun --standalone --nproc_per_node=4 train_mopd.py \
 
 ## 离线评估
 
-海洋工具 Agent 的本地 ReAct 循环、Harness、短程工具 SFT 和配对评估，见
-[ReAct v2 使用与实验说明](<Agent Evaluation/REACT_V2.md>)。此路径不依赖 Claude SDK，不启动 Agentic RL，旧版实验保持不变。
+海洋工具 Agent 的 SDK 运行循环、Harness、短程工具 SFT 和配对评估，见
+[ReAct v2 使用与实验说明](<Agent Evaluation/REACT_V2.md>)。v2 默认使用 OpenAI Agents SDK，不启动 Agentic RL，旧版实验记录保持不变。
 
 ```bash
 cd /home/anhuang/OceanHeart
@@ -341,7 +341,7 @@ SILICONFLOW_API_KEY=... python eval_ocean.py --judge siliconflow \
 
 ## OpenAI Agents SDK 本地运行
 
-本地模型的 OpenAI Agents SDK 运行入口、安装与对照评估见 [Agents SDK 接入说明](Agent%20Evaluation/AGENTS_SDK.md)。现有训练默认行为不变。
+本地模型的运行入口、安装与对照评估见 [Agents SDK 接入说明](Agent%20Evaluation/AGENTS_SDK.md)。v2 交互、评估及工具 SFT 阶段验证默认使用 SDK；SFT 的数据和优化方法不变，旧 v1 GRPO 仍走原路径。
 
 ## 许可与引用
 

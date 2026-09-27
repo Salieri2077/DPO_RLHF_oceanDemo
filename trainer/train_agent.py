@@ -151,7 +151,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["grpo", "sft", "eval", "diagnose"], default="grpo")
     p.add_argument("--agent_version", choices=["v1", "v2"], default="v1")
-    p.add_argument("--runtime", choices=["local", "sdk"], default="local")
+    p.add_argument("--runtime", choices=["local", "sdk"],
+                   help="Default: sdk for v2 SFT/eval, local for legacy v1")
     p.add_argument("--sample_eval", action="store_true")
     p.add_argument("--eval_seed", type=int, default=42)
     p.add_argument("--from_weight", default="ocean_grpo_deepseekv3_eval50")
@@ -184,12 +185,20 @@ def parser():
     return p
 
 
+def runtime_for(args):
+    runtime = args.runtime or ("sdk" if args.agent_version == "v2" else "local")
+    if runtime == "sdk" and (args.agent_version != "v2" or args.mode not in {"sft", "eval"}):
+        raise ValueError("SDK runtime supports v2 SFT validation/evaluation, not Agentic RL")
+    return runtime
+
+
 def main():
     args = parser().parse_args()
-    if args.runtime == "sdk" and (args.agent_version != "v2" or args.mode != "eval"):
-        raise ValueError("SDK runtime currently supports --agent_version v2 --mode eval only")
+    args.runtime = runtime_for(args)
     if args.agent_version == "v2" and args.mode in {"grpo", "diagnose"}:
         raise ValueError("ReAct v2 currently supports SFT/evaluation only; Agentic RL is out of scope")
+    if args.runtime == "sdk":
+        import agent.sdk  # Fail before GPU loading if the SDK environment is missing.
     if min(args.accumulation_steps, args.max_gen_len, args.epochs, args.save_interval, args.eval_interval) < 1 or args.num_generations < 2:
         raise ValueError("invalid training parameters")
     local_rank = init_distributed_mode()
@@ -239,6 +248,11 @@ def main():
         metadata.update(version="ocean-react-v2", max_turns=6, max_calls=4,
                         harness_sha256=file_hash(ROOT / "agent/react.py"))
     if checkpoint:
+        if checkpoint["metadata"].get("runtime", "local") != args.runtime:
+            raise ValueError("resume runtime mismatch; use --runtime local for legacy checkpoints, or start a new run from weights")
+        for key in ("sdk_version", "adapter_sha256"):
+            if checkpoint["metadata"].get(key) != metadata.get(key):
+                raise ValueError(f"resume SDK mismatch: {key}")
         for key in ("input_weight_sha256", "data_manifest_sha256", "tool_sha256", "world_size", "mode",
                     "accumulation_steps", "max_total_len", "max_gen_len", "num_generations", "beta", "epsilon", "learning_rate"):
             if checkpoint["metadata"][key] != metadata[key]:

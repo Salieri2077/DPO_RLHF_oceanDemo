@@ -1,18 +1,22 @@
 # OceanHeart ReAct v2：运行环境与工具 SFT
 
-独立实现，参考 [Hello-Agents](https://github.com/datawhalechina/hello-agents) 的 ReAct 行动—观察循环、[Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) 的会话/工具权限/运行边界思想；未复制其框架代码，不依赖 Claude、外部 Agent SDK 或在线 judge。MiniMind 架构与 Apache-2.0 署名保持不变。本轮**没有 Agentic RL**。
+初始版本独立实现，参考 Hello-Agents 的 ReAct 行动—观察循环及 Claude Agent SDK 的运行边界思想。
+目前默认执行循环已改为 **OpenAI Agents SDK**，详见 [SDK 接入说明](AGENTS_SDK.md)。
+模型、海洋工具、数据协议与 SFT 监督不变；旧循环只用于历史复现/回归。
+MiniMind 架构与 Apache-2.0 署名保持不变。本轮**没有 Agentic RL**。
 
 ## 使用
 
-环境：`/home/anhuang/.conda/envs/minimind/bin/python`，从仓库根目录执行。生成产物与权重不提交 Git。
+环境：激活 `/home/anhuang/.venvs/ocean-agents-sdk`（安装见 SDK 文档），从仓库根目录执行。生成产物与权重不提交 Git。
 
 ```bash
+source /home/anhuang/.venvs/ocean-agents-sdk/bin/activate
 # 只生成一次，存在 manifest 时拒绝覆盖；变更协议应使用新目录。
 python scripts/prepare_ocean_react.py --output data/processed/react-v2
 python -m unittest discover -s tests
 
 # 短程 SFT 单独命令（输出名必须未使用）
-torchrun --standalone --nproc_per_node=4 trainer/train_agent.py \
+python -m torch.distributed.run --standalone --nproc_per_node=4 trainer/train_agent.py \
   --agent_version v2 --mode sft --data_dir data/processed/react-v2 \
   --from_weight ocean_agent_dense-agent-20260927-0232-aligned-sft \
   --save_weight ocean_react_v2_sft --run_name react-v2-sft \
@@ -26,8 +30,8 @@ python scripts/run_ocean_react.py --tag react-v2-YYYYMMDD-HHMM
 # 交互（将权重路径替换为实际最佳权重；首期不提供WebUI）
 python scripts/chat_ocean_react.py --weight out/ocean_react_v2_sft_best_768.pth \
   --session artifacts/agent/chat-example.json --interactive
-# 恢复同一会话；原模型/工具/语料/模板/预算必须一致
-python scripts/chat_ocean_react.py --weight out/ocean_react_v2_sft_best_768.pth \
+# 仅旧 local 会话支持进程中断恢复；SDK 目前支持同进程多轮交互，不支持 crash-resume。
+python scripts/chat_ocean_react.py --runtime local --weight out/ocean_react_v2_sft_best_768.pth \
   --session artifacts/agent/chat-example.json --resume --interactive
 ```
 
@@ -41,7 +45,7 @@ CLI 也支持 `--question '调查船以12 km/h航行3 h，航程是多少？'`�
 
 默认最多6轮生成、4次调用尝试（包括非法调用），每轮192 tokens，完整输入加预留输出最多2048 tokens，单次工具观察最多256 tokens。成功调用重复一次会收到警告，再次重复终止；暂时性错误仅允许一次同参数重试。所有错误和终止原因入轨迹。`valid_calls`/`tool_valid_rate`沿用旧统计口径：**返回无错误的调用比例**，包含执行可用性，不是纯JSON语法准确率。
 
-会话原子快照只在完整轮次边界保存。已保存轮次不会重复执行；进程若恰在工具完成而快照尚未落盘时崩溃，该未提交轮次可能重做。当前仅只读工具，未承诺对有外部写入的工具做到 exactly-once。CLI 一个会话文件同时只由一个进程使用。
+SDK 保存轨迹和工具边界快照，但目前不支持恢复中断进程。旧 local 的恢复快照只在完整轮次边界保存；已保存轮次不会重复执行，进程若恰在工具完成而快照尚未落盘时崩溃，该未提交轮次可能重做。当前仅只读工具，未承诺对有外部写入的工具做到 exactly-once。CLI 一个会话文件同时只由一个进程使用。
 
 ## 数据与监督
 
@@ -58,8 +62,10 @@ OceanInstruct继承原始资料划分，并排除旧Agent基准使用的来源�
 |阶段|权重|Harness|评估|
 |---|---|---|---|
 |A|旧工具SFT|v1|旧50题回归|
-|B|同一旧工具SFT|v2|旧回归、新验证；训练结束后新测试|
-|C|新SFT最佳验证权重|v2|与B配对的相同集合和预算|
+|B|同一旧工具SFT|v2 SDK|旧回归、新验证；训练结束后新测试|
+|C|新SFT最佳验证权重|v2 SDK|与B配对的相同集合和预算|
+
+上述是后续启动的默认流程；已完成的 `react-v2-20260927-1046` 历史实验采用自建循环，记录不追溯改写。
 
 测试不用于选权重。最佳按150题贪心验证成功率选择，持平保留更早权重（可能就是初始权重）；最后权重单独保留。测试另以42/43/44固定种子每题各采样一次，不是best-of-three；报告单次采样均值及按题聚类的配对bootstrap区间。工程只运行一次训练seed，不能据此宣称跨训练seed稳定。
 
