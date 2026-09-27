@@ -110,15 +110,21 @@ def model_generator(model, tokenizer, device, sample=True, save_logps=True):
 
 
 def evaluate(model, tokenizer, tasks, env, args, rank, world, directory, label, group_size=1):
+    rollout, summarize = run_trajectory, aggregate
+    if args.agent_version == "v2":
+        from agent.react import run_trajectory as rollout, aggregate as summarize
     was_training = model.training
     model.eval()
     with torch.random.fork_rng(devices=[args.device.index] if args.device.type == "cuda" else []):
         torch.manual_seed(42 + rank)
-        generator = model_generator(model, tokenizer, args.device, sample=group_size > 1, save_logps=False)
+        generator = model_generator(model, tokenizer, args.device, sample=group_size > 1 or args.sample_eval, save_logps=False)
         traces = []
         for task in tasks[rank::world]:
-            for _ in range(group_size):
-                traces.append(public_trace(run_trajectory(task, tokenizer, env, generator,
+            for sample_index in range(group_size):
+                if args.agent_version == "v2":
+                    seed = int(hashlib.sha256(f"{args.eval_seed}:{task['id']}:{sample_index}".encode()).hexdigest()[:8], 16)
+                    torch.manual_seed(seed)
+                traces.append(public_trace(rollout(task, tokenizer, env, generator,
                                                          max_total_len=args.max_total_len, max_new_tokens=args.max_gen_len)))
     model.train(was_training)
     gathered = [None] * world
@@ -126,7 +132,7 @@ def evaluate(model, tokenizer, tasks, env, args, rank, world, directory, label, 
         dist.all_gather_object(gathered, traces)
         traces = [t for shard in gathered for t in shard]
     traces.sort(key=lambda t: t["id"])
-    summary = aggregate(traces)
+    summary = summarize(traces)
     if rank == 0:
         atomic_jsonl(directory / f"{label}.jsonl", traces)
         atomic_json(directory / f"{label}.json", summary)
@@ -142,6 +148,9 @@ def evaluate(model, tokenizer, tasks, env, args, rank, world, directory, label, 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["grpo", "sft", "eval", "diagnose"], default="grpo")
+    p.add_argument("--agent_version", choices=["v1", "v2"], default="v1")
+    p.add_argument("--sample_eval", action="store_true")
+    p.add_argument("--eval_seed", type=int, default=42)
     p.add_argument("--from_weight", default="ocean_grpo_deepseekv3_eval50")
     p.add_argument("--save_weight", default="ocean_agent_grpo")
     p.add_argument("--run_name", required=True)
@@ -174,6 +183,8 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.agent_version == "v2" and args.mode in {"grpo", "diagnose"}:
+        raise ValueError("ReAct v2 currently supports SFT/evaluation only; Agentic RL is out of scope")
     if min(args.accumulation_steps, args.max_gen_len, args.epochs, args.save_interval, args.eval_interval) < 1 or args.num_generations < 2:
         raise ValueError("invalid training parameters")
     local_rank = init_distributed_mode()
@@ -202,6 +213,11 @@ def main():
     manifest = json.loads((args.data_dir / "agent_manifest.json").read_text())
     if manifest["tool_sha256"] != file_hash(ROOT / "agent/ocean.py"):
         raise ValueError("Tool version changed; regenerate Agent data")
+    if manifest.get("version") == "ocean-react-v2":
+        if args.agent_version != "v2" or manifest["harness_sha256"] != file_hash(ROOT / "agent/react.py"):
+            raise ValueError("ReAct data/harness mismatch; regenerate data")
+    elif args.agent_version == "v2" and args.mode != "eval":
+        raise ValueError("v2 training requires a v2 data manifest")
     for split in manifest["splits"].values():
         for filename, digest in split["artifacts"].items():
             if file_hash(args.data_dir / filename) != digest:
@@ -211,11 +227,16 @@ def main():
     metadata.update(input_weight_sha256=file_hash(source), data_manifest_sha256=file_hash(args.data_dir / "agent_manifest.json"),
                     tool_sha256=file_hash(ROOT / "agent/ocean.py"), version=VERSION, dtype="float16", use_moe=False,
                     batch_size_per_rank=1, world_size=world, max_turns=3, temperature=1., top_p=1., top_k=0)
+    if args.agent_version == "v2":
+        metadata.update(version="ocean-react-v2", max_turns=6, max_calls=4,
+                        harness_sha256=file_hash(ROOT / "agent/react.py"))
     if checkpoint:
         for key in ("input_weight_sha256", "data_manifest_sha256", "tool_sha256", "world_size", "mode",
                     "accumulation_steps", "max_total_len", "max_gen_len", "num_generations", "beta", "epsilon", "learning_rate"):
             if checkpoint["metadata"][key] != metadata[key]:
                 raise ValueError(f"resume configuration mismatch: {key}")
+        if checkpoint["metadata"].get("version") != metadata["version"] or checkpoint["metadata"].get("harness_sha256") != metadata.get("harness_sha256"):
+            raise ValueError("resume harness mismatch")
         raw.load_state_dict(checkpoint["full_precision_model"], strict=True)
     tracker = None
     if rank == 0:
@@ -235,6 +256,9 @@ def main():
                 f.write(json.dumps({"step": step, **values}) + "\n")
 
     def environment(split):
+        if args.agent_version == "v2":
+            from agent.react import ReactTools
+            return ReactTools(read_jsonl(args.data_dir / f"ocean_agent_corpus_{split}.jsonl"))
         return OceanTools(read_jsonl(args.data_dir / f"ocean_agent_corpus_{split}.jsonl"))
 
     if args.mode in {"eval", "diagnose"}:
@@ -243,7 +267,7 @@ def main():
         limit = args.limit or (32 if args.mode == "diagnose" else len(tasks))
         summary = evaluate(raw, tokenizer, tasks[:limit], environment(split), args, rank, world, directory, "result",
                            args.num_generations if args.mode == "diagnose" else 1)
-        log({f"{args.mode}/{k}": v for k, v in summary.items()}, 0)
+        log({f"{args.mode}/{k}": v for k, v in summary.items() if isinstance(v, (int, float))}, 0)
         if tracker:
             tracker.finish()
         if world > 1:
@@ -260,7 +284,11 @@ def main():
         reference.to(args.device).eval().requires_grad_(False)
         dataset = train_tasks
     else:
-        dataset = AgentSFTDataset(args.data_dir / "ocean_agent_sft_train.jsonl", tokenizer, args.max_total_len, deterministic=True)
+        dataset_class = AgentSFTDataset
+        if args.agent_version == "v2":
+            from agent.react import ReactSFTDataset
+            dataset_class = ReactSFTDataset
+        dataset = dataset_class(args.data_dir / "ocean_agent_sft_train.jsonl", tokenizer, args.max_total_len, deterministic=True)
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=42)
     optimizer = torch.optim.AdamW(raw.parameters(), lr=args.learning_rate)
     scaler = torch.amp.GradScaler("cuda", init_scale=1024., enabled=args.device.type == "cuda")
@@ -318,7 +346,7 @@ def main():
     def validation(label):
         nonlocal best
         summary = evaluate(raw, tokenizer, val_tasks, val_env, args, rank, world, directory, label)
-        log({f"val/{k}": v for k, v in summary.items() if k != "gate_pass"}, global_step)
+        log({f"val/{k}": v for k, v in summary.items() if k != "gate_pass" and isinstance(v, (int, float))}, global_step)
         improved = summary["success"] > best
         best = max(best, summary["success"])
         return improved

@@ -319,6 +319,9 @@ torchrun --standalone --nproc_per_node=4 train_mopd.py \
 
 ## 离线评估
 
+海洋工具 Agent 的本地 ReAct 循环、Harness、短程工具 SFT 和配对评估，见
+[ReAct v2 使用与实验说明](<Agent Evaluation/REACT_V2.md>)。此路径不依赖 Claude SDK，不启动 Agentic RL，旧版实验保持不变。
+
 ```bash
 cd /home/anhuang/OceanHeart
 python eval_ocean.py
