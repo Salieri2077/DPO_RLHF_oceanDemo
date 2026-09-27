@@ -341,6 +341,8 @@ SILICONFLOW_API_KEY=... python eval_ocean.py --judge siliconflow \
 
 ## OpenAI Agents SDK 本地运行
 
+想直接查看模型如何调用工具，可打开已保存运行结果的 [Agent 功能演示 Notebook](Agent%20Evaluation/OceanHeart_Agent_Demo.ipynb)，选择 `OceanHeart Agents SDK` 内核。
+
 本地模型的运行入口、安装与对照评估见 [Agents SDK 接入说明](Agent%20Evaluation/AGENTS_SDK.md)。v2 交互、评估及工具 SFT 阶段验证默认使用 SDK；SFT 的数据和优化方法不变，旧 v1 GRPO 仍走原路径。
 
 ## 许可与引用
