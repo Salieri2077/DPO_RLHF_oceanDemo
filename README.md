@@ -339,6 +339,10 @@ SILICONFLOW_API_KEY=... python eval_ocean.py --judge siliconflow \
 
 没有密钥时只跳过 Judge，不影响离线指标。实验结论填写到 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
+## OpenAI Agents SDK 本地运行
+
+本地模型的 OpenAI Agents SDK 运行入口、安装与对照评估见 [Agents SDK 接入说明](Agent%20Evaluation/AGENTS_SDK.md)。现有训练默认行为不变。
+
 ## 许可与引用
 
 - 模型和训练代码派生自 MiniMind，遵循 Apache License 2.0，详见 `LICENSE` 与 `NOTICE`。

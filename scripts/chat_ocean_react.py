@@ -23,11 +23,17 @@ def main():
     p.add_argument("--question")
     p.add_argument("--interactive", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--runtime", choices=["local", "sdk"], default="local")
     p.add_argument("--max_turns", type=int, default=6)
     p.add_argument("--max_calls", type=int, default=4)
     p.add_argument("--max_total_len", type=int, default=2048)
     p.add_argument("--max_new_tokens", type=int, default=192)
     args = p.parse_args()
+    if args.runtime == "sdk" and args.resume:
+        p.error("SDK session resume is not implemented; start a new session")
+    runner = run
+    if args.runtime == "sdk":
+        from agent.sdk import run as runner
     if not args.resume and not args.question and not args.interactive:
         p.error("provide --question or --interactive")
     if args.resume and args.question:
@@ -39,6 +45,10 @@ def main():
                 "harness_sha256": file_hash(ROOT / "agent/react.py"), "tool_sha256": file_hash(ROOT / "agent/ocean.py"),
                 "tokenizer_sha256": file_hash(ROOT / "model/tokenizer.json"),
                 "template_sha256": file_hash(ROOT / "model/tokenizer_config.json"), "budget": budget}
+    if args.runtime == "sdk":
+        from importlib.metadata import version
+        metadata.update(runtime="sdk", sdk_version=version("openai-agents"),
+                        adapter_sha256=file_hash(ROOT / "agent/sdk.py"))
     stored = json.loads(args.session.read_text()) if args.resume else None
     if stored and stored["metadata"] != metadata:
         raise ValueError("Session model/tool/corpus/template/budget changed; use a new session")
@@ -64,7 +74,12 @@ def main():
                 break
             if not question:
                 continue
-        trace = run(question, tokenizer, env, generate, state=trace, save=save, **budget)
+        if args.runtime == "sdk":
+            initial_question = trace["messages"][1]["content"] if trace else question
+            history = trace["messages"][2:] if trace else ()
+            trace = runner(initial_question, tokenizer, env, generate, history=history, save=save, **budget)
+        else:
+            trace = runner(question, tokenizer, env, generate, state=trace, save=save, **budget)
         for r in trace["rounds"]:
             print("助手：", r["text"], flush=True)
         print(f"[{trace['stop']}] {trace['final']}\n轨迹：{args.session}", flush=True)

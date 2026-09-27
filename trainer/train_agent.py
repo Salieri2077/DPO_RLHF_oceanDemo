@@ -113,6 +113,8 @@ def evaluate(model, tokenizer, tasks, env, args, rank, world, directory, label, 
     rollout, summarize = run_trajectory, aggregate
     if args.agent_version == "v2":
         from agent.react import run_trajectory as rollout, aggregate as summarize
+    if args.runtime == "sdk":
+        from agent.sdk import run_trajectory as rollout
     was_training = model.training
     model.eval()
     with torch.random.fork_rng(devices=[args.device.index] if args.device.type == "cuda" else []):
@@ -149,6 +151,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["grpo", "sft", "eval", "diagnose"], default="grpo")
     p.add_argument("--agent_version", choices=["v1", "v2"], default="v1")
+    p.add_argument("--runtime", choices=["local", "sdk"], default="local")
     p.add_argument("--sample_eval", action="store_true")
     p.add_argument("--eval_seed", type=int, default=42)
     p.add_argument("--from_weight", default="ocean_grpo_deepseekv3_eval50")
@@ -183,6 +186,8 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    if args.runtime == "sdk" and (args.agent_version != "v2" or args.mode != "eval"):
+        raise ValueError("SDK runtime currently supports --agent_version v2 --mode eval only")
     if args.agent_version == "v2" and args.mode in {"grpo", "diagnose"}:
         raise ValueError("ReAct v2 currently supports SFT/evaluation only; Agentic RL is out of scope")
     if min(args.accumulation_steps, args.max_gen_len, args.epochs, args.save_interval, args.eval_interval) < 1 or args.num_generations < 2:
@@ -223,6 +228,9 @@ def main():
             if file_hash(args.data_dir / filename) != digest:
                 raise ValueError(f"Data does not match manifest: {filename}")
     metadata = experiment_config(args)
+    if args.runtime == "sdk":
+        from importlib.metadata import version
+        metadata.update(sdk_version=version("openai-agents"), adapter_sha256=file_hash(ROOT / "agent/sdk.py"))
     metadata["device"] = str(args.device)
     metadata.update(input_weight_sha256=file_hash(source), data_manifest_sha256=file_hash(args.data_dir / "agent_manifest.json"),
                     tool_sha256=file_hash(ROOT / "agent/ocean.py"), version=VERSION, dtype="float16", use_moe=False,
