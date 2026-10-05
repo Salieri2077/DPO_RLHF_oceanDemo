@@ -1,0 +1,2 @@
+{"chosen":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"什么是盐跃层？"},{"role":"assistant","content":"盐跃层是盐度梯度较大的水层。"}],"rejected":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"什么是盐跃层？"},{"role":"assistant","content":"盐跃层是海面上的盐堆。"}]}
+{"chosen":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"海流有什么作用？"},{"role":"assistant","content":"海流输送热量、盐分和营养物质。"}],"rejected":[{"role":"system","content":"你是 OceanHeart。"},{"role":"user","content":"海流有什么作用？"},{"role":"assistant","content":"海流没有任何作用。"}]}

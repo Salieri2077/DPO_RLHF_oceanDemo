@@ -1,0 +1,3 @@
+# Optional runtime; install in an isolated venv with MiniMind system site packages.
+openai-agents==0.22.3
+openai==3.19.2
