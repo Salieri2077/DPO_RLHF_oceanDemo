@@ -4,6 +4,7 @@
 目前默认执行循环已改为 **OpenAI Agents SDK**，详见 [SDK 接入说明](AGENTS_SDK.md)。
 模型、海洋工具、数据协议与 SFT 监督不变；旧循环只用于历史复现/回归。
 MiniMind 架构与 Apache-2.0 署名保持不变。本轮**没有 Agentic RL**。
+v2 训练数据句式单一导致换说法即失效，重做的训练数据见 [ReAct v3 数据](REACT_V3_DATA.md)（协议与评分不变）。
 
 ## 使用
 
