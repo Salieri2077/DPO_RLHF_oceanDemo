@@ -1,8 +1,9 @@
 # OceanHeart + OpenAI Agents SDK
 
 交互演示：[OceanHeart_Agent_Demo.ipynb](OceanHeart_Agent_Demo.ipynb)。选择
-`OceanHeart Agents SDK` 内核即可运行；文件内已保存真实执行输出，展示六类固定示例、
-逐轮工具调用与失败结果，并提供可修改问题的单元格。不启动训练或在线 API。
+`OceanHeart Agents SDK` 内核即可运行；文件内已保存真实执行输出，对比 v2 数据与 v3.1 数据
+训练的两个权重：结果总览图表与配对比较、六类固定示例、上一轮典型失败的逐轮工具调用，
+并提供可修改问题的单元格。不启动训练或在线 API。
 
 The default v2 runtime replaces the handwritten ReAct loop with `agents.Runner`.
 `agent/sdk.py` implements the SDK `Model` interface and registers the existing
