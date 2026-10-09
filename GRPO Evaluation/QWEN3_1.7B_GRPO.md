@@ -119,6 +119,34 @@ SFT 测试集前 100 题。SFT 与 GRPO 各生成 1 个 greedy 和 2 个 T=0.8 �
 
 Qwen2.5-72B 输入约 362 万 token（被 429 限流 261 次，均通过等待恢复，无失败组），DeepSeek-V3 评估输入约 76 万 token，合计约 ¥16～18。GRPO 阶段两段累计约 ¥33～35，以 SiliconFlow 账单为准。
 
+## 自动决定训练长度：WSD + 平台检测（2026-10-09）
+
+续训那次是人工判断"走平、该停"。现在 `train_grpo_hf.py` 可以自己做这个判断，规则在 `trainer/rl_schedule.py`。
+
+- **学习率**：`--schedule wsd`，先 warmup，然后保持峰值，直到触发衰减；衰减 `--decay_steps` 步后自动停止。`--max_steps` 只作为预算上限。
+- **每次验证的判断**（每 `--eval_interval` 步一次）：
+  - 验证奖励：取最近 `--plateau_window` 次的平均。16 题的单次验证噪声约 ±0.1～0.15，所以要先平滑。
+  - 训练奖励：取上次验证以来各步的平均。每步都是新题，相当于一个更大的保留集。
+  - 两者都没有比各自历史最好值高出 `--plateau_min_delta`，记为一次"未提升"。连续 `--plateau_patience` 次未提升，就判定走平，开始衰减。第 `--plateau_min_steps` 步之前不做判断。
+  - KL 不作为收敛信号：只要 LR 不为 0，KL 就会继续增长。它只作为安全上限，窗口平均 KL 超过 `--kl_ceiling` 时也立即开始衰减。
+- **默认值用本次 400 步的真实曲线回放标定**（单元测试 `tests/test_grpo.py` 用的也是这组数据）：
+
+| 规则 | 回放结果 |
+|---|---|
+| 默认：window 3，min_delta 0.05，patience 3，min_steps 100，KL 上限 2e-2 | 第 350 步开始衰减，第 400 步停止，与人工决定一致 |
+| patience 2 | 第 250 步就触发，属于被验证噪声误判 |
+| KL 上限改为 1e-2 | 第 300 步因 KL 触发 |
+
+- 判断状态（历史、最好值、计数、窗口）保存在 `state.pt` 中，`--resume` 后继续生效。烟测已确认：停在第 3 步后续训，仍在第 4 步按原计数触发。
+- 日志：SwanLab 中 `plateau/val_smoothed`、`plateau/train_window`、`plateau/kl_window`、`plateau/stale_evals`、`plateau/decaying` 五条曲线；`completion.json` 记录 `stop_reason` 和 `decay_start`。
+
+```bash
+torchrun --standalone --nproc_per_node=4 train_grpo_hf.py --save_adapter <name> --run_name <tag> \
+  --schedule wsd --warmup_steps 10 --decay_steps 50 --plateau_patience 3 --max_steps 600 ...
+```
+
+局限：判断依据仍是训练裁判（Qwen2.5-72B）的分数。"走平"只说明这个裁判下学不动了，不代表真实质量的上限。停止后仍需用独立裁判评估（`evaluate_qwen_grpo.py`）。
+
 ## 复现
 
 ```bash

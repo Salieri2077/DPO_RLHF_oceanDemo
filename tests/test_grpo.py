@@ -11,7 +11,53 @@ from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from trainer.rollout_engine import rollout
 from trainer.train_grpo import grpo_objective, group_advantages, repetition_penalty
+from trainer.rl_schedule import PlateauController, scheduled_lr
 from trainer.trainer_utils import SiliconFlowRewardModel, parse_reward_group
+
+# Evaluations of the 400-step Qwen3-1.7B GRPO run, steps 25..400: validation reward, mean training reward and mean KL
+# over the preceding 25 steps.
+QWEN_RUN = [(25, 1.73, 1.61, 5.6e-5), (50, 1.85, 1.71, 2.6e-4), (75, 1.73, 1.79, 8.2e-4), (100, 2.09, 2.06, 1.6e-3),
+            (125, 2.08, 1.95, 2.5e-3), (150, 2.05, 1.88, 3.1e-3), (175, 2.21, 1.94, 3.7e-3), (200, 2.33, 2.01, 4.2e-3),
+            (225, 2.03, 2.04, 5.1e-3), (250, 1.98, 2.05, 6.5e-3), (275, 2.02, 2.15, 9.3e-3), (300, 2.13, 2.00, 1.2e-2),
+            (325, 2.19, 1.89, 1.1e-2), (350, 2.14, 2.07, 1.2e-2), (375, 2.20, 2.03, 1.2e-2), (400, 2.06, 2.13, 1.1e-2)]
+
+
+def replay(controller):
+    for step, val, train, kl in QWEN_RUN:
+        controller.update(step, val, train, kl)
+        if controller.decay_start is not None:
+            return controller.decay_start
+    return None
+
+
+class RLScheduleTest(unittest.TestCase):
+    def test_wsd_rewarms_holds_and_decays(self):
+        lr = lambda s: scheduled_lr(s, 1e-5, 10, 200, 350, 50)
+        self.assertAlmostEqual(lr(201), 1e-6)
+        self.assertAlmostEqual(lr(210), 1e-5)
+        self.assertAlmostEqual(lr(350), 1e-5)
+        self.assertAlmostEqual(lr(375), 5.5e-6)
+        self.assertAlmostEqual(lr(400), 1e-6)
+        # A whole-run cosine is the same formula with the decay starting at step 0.
+        self.assertAlmostEqual(scheduled_lr(100, 1e-5, 10, 0, 0, 200), 5.5e-6)
+
+    def test_plateau_controller_matches_the_manual_call(self):
+        self.assertEqual(replay(PlateauController()), 350)
+        self.assertEqual(replay(PlateauController(patience=2)), 250)  # too eager: fires on validation noise
+        controller = PlateauController(kl_ceiling=1e-2)
+        self.assertEqual(replay(controller), 300)
+        self.assertIn("KL", controller.reason)
+
+    def test_plateau_state_round_trip(self):
+        first = PlateauController()
+        for step, val, train, kl in QWEN_RUN[:9]:
+            first.update(step, val, train, kl)
+        second = PlateauController()
+        second.load_state_dict(first.state_dict())
+        for step, val, train, kl in QWEN_RUN[9:]:
+            first.update(step, val, train, kl)
+            second.update(step, val, train, kl)
+        self.assertEqual((first.decay_start, first.stale), (second.decay_start, second.stale))
 
 
 class GRPOTest(unittest.TestCase):

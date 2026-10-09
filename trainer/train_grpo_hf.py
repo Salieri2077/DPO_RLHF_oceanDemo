@@ -8,10 +8,13 @@ request with the candidates shuffled; group-normalised scores are the advantages
 flat (std below --flat_std) get no update, so small shaping noise is never amplified. One update per rollout
 (on-policy): the ratio is exp(logp - logp.detach()), so PPO clipping is moot and not used. LoRA gradients are
 summed across ranks and divided by the number of ranks with an active group.
+
+With --schedule wsd and --plateau_patience > 0 the run decides its own length: the learning rate is held at the peak
+until the validation and training rewards stop improving (or KL passes a ceiling), then it decays over --decay_steps
+and training stops; --max_steps remains the budget cap. See trainer/rl_schedule.py.
 """
 import argparse
 import json
-import math
 import random
 import sys
 import time
@@ -24,6 +27,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from trainer.hf_chat import generation_prompt, load_tokenizer
+from trainer.rl_schedule import PlateauController, scheduled_lr
 from trainer.train_agent import atomic_json
 from trainer.trainer_utils import SiliconFlowRewardModel, experiment_config, init_distributed_mode, init_swanlab, reduce_sums, setup_seed
 
@@ -50,6 +54,12 @@ def parser():
                         "last --decay_steps (lets a run be extended without re-planning its length)")
     p.add_argument("--schedule_start", type=int, default=0, help="step where (re)warmup starts, e.g. the resumed step")
     p.add_argument("--decay_steps", type=int, default=50)
+    p.add_argument("--plateau_patience", type=int, default=0,
+                   help="wsd only: start the decay after this many evaluations without improvement (0 = off)")
+    p.add_argument("--plateau_min_delta", type=float, default=0.05, help="smallest reward gain that counts as improvement")
+    p.add_argument("--plateau_window", type=int, default=3, help="evaluations averaged for the validation reward")
+    p.add_argument("--plateau_min_steps", type=int, default=100, help="no plateau decision before this step")
+    p.add_argument("--kl_ceiling", type=float, default=2e-2, help="windowed KL that starts the decay early (0 = off)")
     p.add_argument("--beta", type=float, default=0.04, help="KL(policy || SFT reference) coefficient")
     p.add_argument("--flat_std", type=float, default=0.25, help="judge-score std below which a group is skipped")
     p.add_argument("--lora_rank", type=int, default=32)
@@ -146,6 +156,8 @@ def main():
     if Path(args.run_name).name != args.run_name or Path(args.save_adapter).name != args.save_adapter:
         raise ValueError("run_name and save_adapter must be simple names")
     directory = ROOT / "artifacts/grpo_hf" / args.run_name
+    if args.plateau_patience and args.schedule != "wsd":
+        raise SystemExit("--plateau_patience needs --schedule wsd: only WSD can start its decay when the run plateaus")
     if not args.resume and (directory / "state.pt").exists():
         raise FileExistsError("run exists; pass --resume or use a new --run_name")
     local_rank = init_distributed_mode()
@@ -177,6 +189,9 @@ def main():
     scaler.scale(torch.zeros((), device=device))  # initialise the scale on every rank, even one whose first group is flat
     judge = SiliconFlowRewardModel(api_key, args.reward_model)
     step, judge_failures, swanlab_id = 0, 0, args.swanlab_id
+    plateau = PlateauController(args.plateau_patience, args.plateau_min_delta, args.plateau_window,
+                                args.plateau_min_steps, args.kl_ceiling) if args.plateau_patience else None
+    window_rewards, window_kls = [], []  # per-step training reward and KL since the last evaluation
     if args.resume:
         state = torch.load(directory / "state.pt", map_location="cpu", weights_only=False)
         set_peft_model_state_dict(model, state["adapter"])
@@ -184,14 +199,21 @@ def main():
         scaler.load_state_dict(state["scaler"])
         step, judge_failures = state["step"], state["judge_failures"]
         swanlab_id = swanlab_id or state.get("swanlab_id")
+        if plateau and state.get("plateau"):
+            plateau.load_state_dict(state["plateau"])
+            window_rewards, window_kls = state["plateau_windows"]
+
+    def decay_start():
+        if args.schedule == "cosine":
+            return 0
+        return plateau.decay_start if plateau and plateau.decay_start is not None else args.max_steps - args.decay_steps
 
     def learning_rate(s):
-        warmup = min(1., max(s - args.schedule_start, 0) / max(args.warmup_steps, 1))
-        if args.schedule == "cosine":
-            progress = min(s / args.max_steps, 1)
-        else:  # warmup-stable-decay
-            progress = min(max(s - (args.max_steps - args.decay_steps), 0) / max(args.decay_steps, 1), 1)
-        return args.learning_rate * warmup * (.1 + .9 * (1 + math.cos(math.pi * progress)) / 2)
+        decay_steps = args.max_steps if args.schedule == "cosine" else args.decay_steps
+        return scheduled_lr(s, args.learning_rate, args.warmup_steps, args.schedule_start, decay_start(), decay_steps)
+
+    def end_step():
+        return args.max_steps if args.schedule == "cosine" else min(args.max_steps, decay_start() + args.decay_steps)
 
     metadata = experiment_config(argparse.Namespace(**vars(args), data_path=str(DATA / "ocean_sft_val.jsonl")))
     metadata.update(world_size=world, prompt_pool=len(pool), prompts_per_step=world, dtype="float16 base, float32 LoRA",
@@ -222,7 +244,8 @@ def main():
             from peft import get_peft_model_state_dict
             torch.save({"adapter": get_peft_model_state_dict(model), "optimizer": optimizer.state_dict(),
                         "scaler": scaler.state_dict(), "step": step, "judge_failures": judge_failures,
-                        "swanlab_id": swanlab_id},
+                        "swanlab_id": swanlab_id, "plateau": plateau.state_dict() if plateau else None,
+                        "plateau_windows": (window_rewards, window_kls)},
                        directory / "state.pt.tmp")
             (directory / "state.pt.tmp").replace(directory / "state.pt")
         if world > 1:
@@ -255,11 +278,25 @@ def main():
         log(values, step)
         if rank == 0:
             print(f"validation step={step} {json.dumps(values)}", flush=True)
+        return values["val/reward_mean"]
+
+    def check_plateau(val_reward):
+        """Feed one evaluation to the controller; identical reduced inputs give every rank the same decision."""
+        if not plateau or not window_rewards:
+            return
+        was_decaying = plateau.decay_start is not None
+        values = plateau.update(step, val_reward, sum(window_rewards) / len(window_rewards),
+                                sum(window_kls) / len(window_kls) if window_kls else 0.)
+        window_rewards.clear()
+        window_kls.clear()
+        log(values, step)
+        if rank == 0 and not was_decaying and plateau.decay_start is not None:
+            print(f"plateau at step={step}: {plateau.reason}; decaying until step {end_step()}", flush=True)
 
     if step == 0:
         validate()
     started = time.monotonic()
-    while step < args.max_steps:
+    while step < end_step():
         conversations = pool[(step * world + rank) % len(pool)]
         t0 = time.monotonic()
         output, full_mask, completion_mask, start, texts, ended = sample(model, tokenizer, conversations, args.num_generations, args, stop, device)
@@ -335,13 +372,16 @@ def main():
                   "judge/prompt_tokens": prompt_tokens, "judge/completion_tokens": completion_tokens,
                   "judge/rate_limited": rate_limited}
         log(values, step)
+        window_rewards.append(values["train/reward_mean"])
+        if active_tokens:
+            window_kls.append(values["train/kl"])
         if rank == 0:
-            print(f"step={step}/{args.max_steps} " + json.dumps({k.split('/')[-1]: float(f"{v:.4g}") for k, v in values.items()}), flush=True)
+            print(f"step={step}/{end_step()} " + json.dumps({k.split('/')[-1]: float(f"{v:.4g}") for k, v in values.items()}), flush=True)
         if judge_failures > args.max_judge_failures:
             save("_last")
             raise RuntimeError(f"judge failed {judge_failures} times; state saved, fix the API and --resume")
         if step % args.eval_interval == 0:
-            validate()
+            check_plateau(validate())
         if step % args.save_interval == 0:
             save("_last")
     if step % args.eval_interval:
@@ -350,6 +390,9 @@ def main():
     requests, prompt_tokens, completion_tokens, _ = usage_totals()  # collective: every rank must call it
     if rank == 0:
         atomic_json(directory / "completion.json", {"step": step, "elapsed_seconds": time.monotonic() - started,
+                                                    "stop_reason": (plateau.reason if plateau and plateau.decay_start is not None
+                                                                    else "max_steps"),
+                                                    "decay_start": decay_start(),
                                                     "judge_requests": requests, "judge_prompt_tokens": prompt_tokens,
                                                     "judge_completion_tokens": completion_tokens, "judge_failures": judge_failures})
     if tracker:
