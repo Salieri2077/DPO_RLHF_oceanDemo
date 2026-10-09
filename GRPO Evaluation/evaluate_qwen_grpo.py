@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Paired evaluation of the Qwen3-1.7B Ocean SFT model and its GRPO LoRA on fixed Ocean test questions.
+"""Paired evaluation of the Qwen3-1.7B Ocean SFT model and its GRPO LoRA(s) on fixed Ocean test questions.
 
-Both models share the merged SFT weights; the SFT side runs with the GRPO adapter disabled. Per question and model:
+All models share the merged SFT weights; the SFT side runs with adapters disabled. Several GRPO adapters
+(e.g. two checkpoints of one run) can be compared in the same judge requests with --adapter name=path. Per question and model:
 one greedy answer and `samples` answers at the GRPO rollout temperature (GRPO is expected to help sampled answers
 most). All candidates of a question are judged in one request, twice (seeded random order, then reversed), and
 averaged. The evaluation judge differs from the training judge to limit reward hacking of one judge.
@@ -22,7 +23,18 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 import torch
 
-MODELS = ("sft", "grpo")
+
+def adapters(args):
+    """[(name, path)] from repeated --adapter name=path (a bare path is named "grpo")."""
+    parsed = []
+    for item in args.adapter:
+        name, _, path = item.rpartition("=") if "=" in item else ("grpo", "", item)
+        parsed.append((name, Path(path)))
+    return parsed
+
+
+def model_names(args):
+    return ["sft"] + [name for name, _ in adapters(args)]
 
 
 def test_questions(limit):
@@ -35,7 +47,10 @@ def stage_generate(args):
     from peft import PeftModel
     from trainer.hf_chat import generation_prompt, load_model, load_tokenizer
     tokenizer = load_tokenizer(args.merged)
-    model = PeftModel.from_pretrained(load_model(args.merged, None, "cuda"), args.adapter).eval()
+    (first, first_path), *rest = adapters(args)
+    model = PeftModel.from_pretrained(load_model(args.merged, None, "cuda"), first_path, adapter_name=first).eval()
+    for name, path in rest:
+        model.load_adapter(path, adapter_name=name)
     stop = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|im_end|>")]
     output = args.output / f"generations_shard{args.shard}.jsonl"
     done = {json.loads(line)["id"] for line in output.open(encoding="utf-8")} if output.exists() else set()
@@ -67,10 +82,12 @@ def stage_generate(args):
             inputs = tokenizer(generation_prompt(conversations), return_tensors="pt", add_special_tokens=False).to("cuda")
             seed = args.seed + zlib.crc32(str(row["id"]).encode())
             with model.disable_adapter():
-                sft = answers(inputs, seed)
-            grpo = answers(inputs, seed)
+                result = {"sft": answers(inputs, seed)}
+            for name, _ in adapters(args):
+                model.set_adapter(name)
+                result[name] = answers(inputs, seed)
             f.write(json.dumps({"id": row["id"], "question": conversations[-2]["content"], "reference": conversations[-1]["content"],
-                                "answers": {"sft": sft, "grpo": grpo}}, ensure_ascii=False) + "\n")
+                                "answers": result}, ensure_ascii=False) + "\n")
             f.flush()
             print(row["id"], flush=True)
 
@@ -81,9 +98,9 @@ def bootstrap(values, seed, repeats=2000):
     return [means[int(.025 * (repeats - 1))], means[int(.975 * (repeats - 1))]]
 
 
-def candidates(row):
+def candidates(row, names):
     out = []
-    for model in MODELS:
+    for model in names:
         out.append((f"{model}:greedy", row["answers"][model]["greedy"]["text"]))
         out += [(f"{model}:s{i}", s["text"]) for i, s in enumerate(row["answers"][model]["samples"])]
     return out
@@ -103,7 +120,7 @@ def stage_judge(args):
         for row in rows:
             if row["id"] in done:
                 continue
-            items = candidates(row)
+            items = candidates(row, model_names(args))
             order = items[:]
             random.Random(f"{args.seed}:{row['id']}").shuffle(order)
             passes = []
@@ -120,10 +137,11 @@ def summarize(args, rows, usage=None):
     path = args.output / f"judged_{args.judge_model.replace('/', '_')}.jsonl"
     judged = {json.loads(line)["id"]: json.loads(line) for line in path.open(encoding="utf-8")}
     rows = [r for r in rows if r["id"] in judged]
-    summary = {"judge_model": args.judge_model, "questions": len(rows), "adapter": str(args.adapter), "samples": args.samples,
-               "temperature": args.temperature, "models": {}, "deltas_grpo_minus_sft": {}}
+    names = model_names(args)
+    summary = {"judge_model": args.judge_model, "questions": len(rows), "adapters": {n: str(p) for n, p in adapters(args)},
+               "samples": args.samples, "temperature": args.temperature, "models": {}, "deltas": {}}
     per = {}
-    for model in MODELS:
+    for model in names:
         greedy = [judged[r["id"]]["scores"][f"{model}:greedy"] for r in rows]
         sampled = [st.mean(judged[r["id"]]["scores"][f"{model}:s{i}"] for i in range(args.samples)) for r in rows]
         worst = [min(judged[r["id"]]["scores"][f"{model}:s{i}"] for i in range(args.samples)) for r in rows]
@@ -134,11 +152,14 @@ def summarize(args, rows, usage=None):
             "share_scores_le_minus1": sum(judged[r["id"]]["scores"][f"{model}:{k}"] <= -1 for r in rows
                                           for k in ["greedy"] + [f"s{i}" for i in range(args.samples)]) / (len(rows) * (args.samples + 1)),
             "eos_rate": sum(a["eos"] for a in meta) / len(meta), "mean_tokens": st.mean(a["tokens"] for a in meta)}
-    for kind in ("greedy", "sampled", "worst_sample"):
-        deltas = [g - s for g, s in zip(per["grpo"][kind], per["sft"][kind])]
-        summary["deltas_grpo_minus_sft"][kind] = {"mean": st.mean(deltas), "ci95": bootstrap(deltas, args.seed),
-                                                  "wins": sum(d > 0 for d in deltas), "losses": sum(d < 0 for d in deltas),
-                                                  "ties": sum(d == 0 for d in deltas)}
+    pairs = [(name, "sft") for name in names[1:]] + ([(names[-1], names[1])] if len(names) > 2 else [])
+    for new, old in pairs:
+        summary["deltas"][f"{new} - {old}"] = {}
+        for kind in ("greedy", "sampled", "worst_sample"):
+            deltas = [a - b for a, b in zip(per[new][kind], per[old][kind])]
+            summary["deltas"][f"{new} - {old}"][kind] = {
+                "mean": st.mean(deltas), "ci95": bootstrap(deltas, args.seed), "wins": sum(d > 0 for d in deltas),
+                "losses": sum(d < 0 for d in deltas), "ties": sum(d == 0 for d in deltas)}
     summary["order_disagreement_gt1"] = sum(abs(j["passes"][0][n] - j["passes"][1][n]) > 1 for j in judged.values() for n in j["scores"])
     if usage:
         summary["judge_usage_this_run"] = usage
@@ -150,7 +171,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=["generate", "judge", "summary"], required=True)
     parser.add_argument("--merged", type=Path, default=ROOT / "out/hf/qwen3_1.7b_ocean_sft_r64_eot_merged")
-    parser.add_argument("--adapter", type=Path, required=True, help="GRPO LoRA adapter directory")
+    parser.add_argument("--adapter", action="append", required=True,
+                        help="GRPO LoRA adapter as name=path (repeatable); a bare path is named grpo")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--questions", type=int, default=100)
     parser.add_argument("--samples", type=int, default=2)

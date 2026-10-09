@@ -45,6 +45,11 @@ def parser():
     p.add_argument("--loss_chunk", type=int, default=1024)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--warmup_steps", type=int, default=10)
+    p.add_argument("--schedule", choices=["cosine", "wsd"], default="cosine",
+                   help="cosine: warmup then cosine to 10%% at max_steps; wsd: warmup, constant, cosine to 10%% over the "
+                        "last --decay_steps (lets a run be extended without re-planning its length)")
+    p.add_argument("--schedule_start", type=int, default=0, help="step where (re)warmup starts, e.g. the resumed step")
+    p.add_argument("--decay_steps", type=int, default=50)
     p.add_argument("--beta", type=float, default=0.04, help="KL(policy || SFT reference) coefficient")
     p.add_argument("--flat_std", type=float, default=0.25, help="judge-score std below which a group is skipped")
     p.add_argument("--lora_rank", type=int, default=32)
@@ -181,8 +186,12 @@ def main():
         swanlab_id = swanlab_id or state.get("swanlab_id")
 
     def learning_rate(s):
-        return args.learning_rate * min(1., s / max(args.warmup_steps, 1)) * (
-            .1 + .9 * (1 + math.cos(math.pi * min(s / args.max_steps, 1))) / 2)
+        warmup = min(1., max(s - args.schedule_start, 0) / max(args.warmup_steps, 1))
+        if args.schedule == "cosine":
+            progress = min(s / args.max_steps, 1)
+        else:  # warmup-stable-decay
+            progress = min(max(s - (args.max_steps - args.decay_steps), 0) / max(args.decay_steps, 1), 1)
+        return args.learning_rate * warmup * (.1 + .9 * (1 + math.cos(math.pi * progress)) / 2)
 
     metadata = experiment_config(argparse.Namespace(**vars(args), data_path=str(DATA / "ocean_sft_val.jsonl")))
     metadata.update(world_size=world, prompt_pool=len(pool), prompts_per_step=world, dtype="float16 base, float32 LoRA",
