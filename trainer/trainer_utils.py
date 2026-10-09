@@ -352,6 +352,7 @@ class SiliconFlowRewardModel:
             raise ValueError("SILICONFLOW_API_KEY is required")
         self.api_key = api_key
         self.model = model
+        self.usage = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "rate_limited": 0}  # for cost tracking
 
     def _request(self, user_content, max_tokens=128):
         body = {
@@ -375,25 +376,36 @@ class SiliconFlowRewardModel:
             data=payload,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=60) as result:
-            return json.loads(result.read(), strict=False)["choices"][0]["message"]["content"]
+        with urllib.request.urlopen(request, timeout=120) as result:
+            response = json.loads(result.read(), strict=False)
+        usage = response.get("usage") or {}
+        self.usage["requests"] += 1
+        self.usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        self.usage["completion_tokens"] += usage.get("completion_tokens", 0)
+        return response["choices"][0]["message"]["content"]
 
-    def score_group(self, question, reference, responses):
+    def score_group(self, question, reference, responses, attempts=8):
         prompt = (f"本次恰好有{len(responses)}个候选，scores必须恰好包含{len(responses)}个数字。\n"
                   + json.dumps({"question": question, "reference": reference,
                                 "candidates": responses}, ensure_ascii=False))
-        for attempt in range(3):
+        for attempt in range(attempts):
+            wait = 2 ** min(attempt, 2)
             try:
                 return parse_reward_group(self._request(prompt), len(responses))
             except urllib.error.HTTPError as exc:
                 if exc.code not in {429, 500, 502, 503, 504}:
                     raise
                 error = exc
-            except (urllib.error.URLError, KeyError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                if exc.code == 429:  # per-account RPM/TPM limit: wait out the minute window instead of failing
+                    self.usage["rate_limited"] += 1
+                    retry_after = (exc.headers or {}).get("Retry-After", "")
+                    wait = float(retry_after) if retry_after.isdigit() else min(60, 10 * 2 ** attempt)
+                    wait *= random.uniform(1, 1.3)  # desynchronise concurrent clients
+            except (urllib.error.URLError, TimeoutError, ConnectionError, KeyError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 error = exc
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"SiliconFlow reward failed after 3 attempts: {error}")
+            if attempt < attempts - 1:
+                time.sleep(wait)
+        raise RuntimeError(f"SiliconFlow reward failed after {attempts} attempts: {error}")
 
     def get_score(self, messages, response):
         question = next((message["content"] for message in reversed(messages) if message["role"] == "user"), "")

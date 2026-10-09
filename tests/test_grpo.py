@@ -54,6 +54,22 @@ class GRPOTest(unittest.TestCase):
         with patch("trainer.trainer_utils.time.sleep"):
             self.assertEqual(judge.score_group("海浪是什么？", "参考", ["a", "b", "c", "d"]), [1.0, 2.0, 3.0, 3.0])
 
+    def test_group_judge_waits_out_rate_limits(self):
+        import urllib.error
+        judge = SiliconFlowRewardModel("test-key")
+        replies = iter([urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)] * 2 + ["[1, 2]"])
+
+        def request(_):
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        judge._request = request
+        with patch("trainer.trainer_utils.time.sleep") as sleep:
+            self.assertEqual(judge.score_group("海浪是什么？", "参考", ["a", "b"]), [1.0, 2.0])
+        self.assertEqual(judge.usage["rate_limited"], 2)
+        self.assertGreaterEqual(min(call.args[0] for call in sleep.call_args_list), 10)
+
     def test_group_judge_accepts_control_character_in_http_json(self):
         response = io.BytesIO(b'{"choices":[{"message":{"content":"[1,\n2]"}}]}')
         judge = SiliconFlowRewardModel("test-key")
