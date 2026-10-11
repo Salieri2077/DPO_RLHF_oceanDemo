@@ -63,7 +63,7 @@ def run_shard(args):
         model = PeftModel.from_pretrained(model, args.adapter)
     model.eval()
     lab = OceanLab("dev")
-    harness = OceanLabHarness(Scorer(lab.data))
+    harness = OceanLabHarness(Scorer(lab.data), prompt=args.prompt)
     greedy = model_generator(model, tokenizer, device, sample=False, save_logps=False)
     sampled = model_generator(model, tokenizer, device, sample=True, save_logps=False)
     budget = {k: getattr(args, k) for k in BUDGET}
@@ -87,7 +87,7 @@ def run_shard(args):
                       f"turns={m['turns']} calls={m['calls']} gen={m['generated_tokens']} {trace['seconds']}s", flush=True)
 
 
-def summarize(traces):
+def summarize(traces, requests=None):
     from agent.oceanlab.scoring import aggregate
     env_bad = sorted({t["id"] for t in traces if t["metrics"]["env_error"]})
     greedy = [t for t in traces if t["sample"] < 0]
@@ -124,6 +124,16 @@ def summarize(traces):
         at = lambda q: values[min(len(values) - 1, int(q * len(values)))]
         return {"p50": at(.5), "p90": at(.9), "p99": at(.99), "max": values[-1]}
     out["lengths"] = {k: pct(v) for k, v in lengths.items() if v}
+    if requests:  # request set v2: success by request type, period kind and follow-up
+        info = {r["id"]: r for r in requests}
+        for name, key in (("request_type", lambda r: r.get("request_type", "v1")),
+                          ("kind", lambda r: f"{r.get('request_type', 'v1')}/{r.get('kind', '-')}"),
+                          ("followup", lambda r: r.get("followup", {}).get("type", "-"))):
+            for label, subset in (("greedy", greedy), ("sampled", sampled)):
+                cells = {}
+                for t in subset:
+                    cells.setdefault(key(info[t["id"]]), []).append(t["metrics"]["success"])
+                out.setdefault(f"success_by_{name}", {})[label] = {k: round(sum(v) / len(v), 4) for k, v in sorted(cells.items())}
     return out
 
 
@@ -139,7 +149,7 @@ def merge(args):
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
     summary = {"config": config, "episodes": len(traces),
-               **summarize(traces)}
+               **summarize(traces, requests)}
     (args.out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1))
     print(json.dumps({k: v for k, v in summary.items() if k != "config"}, ensure_ascii=False, indent=1))
     if summary["env_error_requests"]:
@@ -153,6 +163,7 @@ def main():
     p.add_argument("--model_path", type=Path, default=Path("/data/anhuang/oceanheart_models/qwen3-1.7b"))
     p.add_argument("--adapter", type=Path, help="LoRA adapter directory (omit for the bare model)")
     p.add_argument("--chat_template", choices=["minimind", "native"], default="minimind")
+    p.add_argument("--prompt", choices=["v1", "v2"], default="v1", help="environment system prompt (v2 for request set v2)")
     p.add_argument("--requests", type=Path, default=REQUESTS)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--samples", type=int, default=8)
@@ -165,7 +176,7 @@ def main():
     if args.merge:
         return merge(args)
     args.out.mkdir(parents=True, exist_ok=True)
-    config = {"model_path": str(args.model_path), "chat_template": args.chat_template,
+    config = {"model_path": str(args.model_path), "chat_template": args.chat_template, "prompt": args.prompt,
               "model_config_sha256": file_hash(args.model_path / "config.json"),
               "adapter": str(args.adapter) if args.adapter else None,
               "adapter_sha256": file_hash(args.adapter / "adapter_model.safetensors") if args.adapter else None,

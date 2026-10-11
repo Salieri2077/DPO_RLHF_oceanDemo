@@ -42,8 +42,8 @@ DEMOS = ROOT / "data/processed/oceanlab/c0/oceanlab_c0_demos_v1.jsonl"
 class TurnSamples(torch.utils.data.Dataset):
     """(prompt + target ids, index of the first target token) for every assistant turn of the selected demos."""
 
-    def __init__(self, rows, tokenizer, max_len):
-        harness = OceanLabHarness()
+    def __init__(self, rows, tokenizer, max_len, prompt="v1"):
+        harness = OceanLabHarness(prompt=prompt)
         self.samples = []
         for row in rows:
             messages = row["messages"]
@@ -83,6 +83,7 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model_path", type=Path, default=Path("/data/anhuang/oceanheart_models/qwen3-1.7b"))
     p.add_argument("--chat_template", choices=["minimind", "native"], default="native")
+    p.add_argument("--prompt", choices=["v1", "v2"], default="v1", help="environment system prompt the demos were rendered with")
     p.add_argument("--demos", type=Path, default=DEMOS)
     p.add_argument("--subset", type=int, required=True, help="train on demonstrations with rank < subset")
     p.add_argument("--save_adapter", required=True, help="adapter name under out/hf/ (writes <name>_final)")
@@ -126,7 +127,8 @@ def main():
     holdout_rows = [r for r in rows if r["holdout"]]
     if args.subset > sum(not r["holdout"] for r in rows):
         raise ValueError("subset larger than the training demonstrations")
-    train, holdout = TurnSamples(train_rows, tokenizer, args.max_len), TurnSamples(holdout_rows, tokenizer, args.max_len)
+    train = TurnSamples(train_rows, tokenizer, args.max_len, args.prompt)
+    holdout = TurnSamples(holdout_rows, tokenizer, args.max_len, args.prompt)
 
     from peft import LoraConfig, get_peft_model
     model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=torch.float16).to(device)

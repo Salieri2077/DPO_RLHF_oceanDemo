@@ -40,16 +40,19 @@ def main():
     p.add_argument("--requests", type=Path, default=ROOT / "data/processed/oceanlab/oceanlab_train_v1.jsonl")
     p.add_argument("--model_path", type=Path, default=Path("/data/anhuang/oceanheart_models/qwen3-1.7b"))
     p.add_argument("--chat_template", choices=["minimind", "native"], default="native")
+    p.add_argument("--prompt", choices=["v1", "v2"], default="v1",
+                   help="environment system prompt; v2 renders the same demonstrations under the v2 prompt")
     p.add_argument("--holdout", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", type=Path, default=ROOT / "data/processed/oceanlab/c0")
     args = p.parse_args()
-    path = args.output / f"{VERSION}.jsonl"
+    version = VERSION if args.prompt == "v1" else f"{VERSION}_prompt{args.prompt}"
+    path = args.output / f"{version}.jsonl"
     if path.exists():
         raise FileExistsError(f"{path} exists; demonstration sets are frozen once written")
     tokenizer = agent_tokenizer(args.model_path) if args.chat_template == "minimind" else native_tokenizer(args.model_path, False)
     lab = OceanLab("train")
-    harness = OceanLabHarness(Scorer(lab.data))
+    harness = OceanLabHarness(Scorer(lab.data), prompt=args.prompt)
     requests = read_jsonl(args.requests)
     rows, rejected = [], []
     for spec in requests:
@@ -81,7 +84,7 @@ def main():
     train = [r for r in rows if not r["holdout"]]
     count = lambda key, subset: dict(collections.Counter(r[key] for r in subset))
     manifest = {
-        "version": VERSION, "requests": str(args.requests.relative_to(ROOT)), "requests_sha256": file_hash(args.requests),
+        "version": version, "prompt": args.prompt, "requests": str(args.requests.relative_to(ROOT)), "requests_sha256": file_hash(args.requests),
         "model_path": str(args.model_path), "chat_template": args.chat_template,
         "chat_template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
         "env_sha256": file_hash(ROOT / "agent/oceanlab/env.py"), "oracle_sha256": file_hash(ROOT / "agent/oceanlab/oracle.py"),
@@ -95,7 +98,7 @@ def main():
         "assistant_tokens_per_demo": round(sum(r["assistant_tokens"] for r in rows) / len(rows), 1),
         "sha256": file_hash(path),
     }
-    (args.output / f"{VERSION}_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
+    (args.output / f"{version}_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
     print(json.dumps({k: v for k, v in manifest.items() if k != "rejected"} | {"rejected": len(rejected)},
                      ensure_ascii=False, indent=1))
 
