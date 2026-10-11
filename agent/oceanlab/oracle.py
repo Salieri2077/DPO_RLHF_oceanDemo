@@ -33,12 +33,13 @@ def status_of(cells):
     return "insufficient" if not any(cells) else "partial"
 
 
-def oracle_texts(spec, lab):
+def oracle_texts(spec, lab, episode=None):
     """-> list of assistant texts: query, the requested computations, then the structured final.
 
     Each plan states, in one sentence, how the request text maps to the call (hemisphere signs, groups, depth range)
-    or how the support status follows from the tool outputs."""
-    episode = lab.episode()
+    or how the support status follows from the tool outputs. For a multiturn task pass the episode in which the
+    earlier turns' calls were replayed, so the handles it creates continue their numbering."""
+    episode = episode or lab.episode()
     texts = []
 
     def act(plan, name, arguments):

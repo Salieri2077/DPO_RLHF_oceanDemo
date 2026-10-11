@@ -370,6 +370,83 @@ class FakeEnvironmentTests(unittest.TestCase):
         self.assertNotIn("rows", seen["groups"][0])
 
 
+@unittest.skipUnless(HAS_SDK, "optional SDK environment required")
+class RequestSetV2Tests(unittest.TestCase):
+    """Request set v2 building blocks and the v2 environment (prompt, multiturn replay, handle reuse)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = AutoTokenizer.from_pretrained(ROOT / "model")
+        cls.data = FakeData(fake_profiles())
+        cls.lab = OceanLab("dev", cls.data)
+
+    def test_seasons_follow_the_hemisphere(self):
+        from agent.oceanlab.requests_v2 import season_months, season_phrase
+        self.assertEqual(season_months("冬季", "N", 2017), ["2017-12", "2018-01", "2018-02"])
+        self.assertEqual(season_months("冬季", "S", 2017), ["2017-06", "2017-07", "2017-08"])
+        self.assertEqual(season_months("夏季", "S", 2017), ["2017-12", "2018-01", "2018-02"])
+        self.assertEqual(season_phrase("冬季", "N", 2017), "2017/18年冬季")
+        self.assertEqual(season_phrase("冬季", "S", 2017), "2017年冬季")
+
+    def test_region_text_keeps_hemisphere_signs(self):
+        from agent.oceanlab.requests_v2 import region_text
+        box = [[-20, -10], [-130, -120]]
+        self.assertEqual(region_text(box, "degree_letters"), "10°S–20°S、120°W–130°W")
+        self.assertEqual(region_text(box, "english"), "10-20S, 120-130W")
+        self.assertEqual(region_text(box, "center"), "以南纬15度、西经125度为中心，南北各5度、东西各5度的方框")
+        self.assertIn("经度-130到-120", region_text(box, "signed"))
+
+    def test_extraction_must_match_the_spec_exactly(self):
+        from agent.oceanlab.requests_v2 import mismatches
+        spec = {"region": [[-20, -10], [120, 130]], "groups": [{"months": ["2018-03"]}, {"months": ["2018-04"]}],
+                "analyses": ["consistency"], "consistency": {"variable": "salinity", "depth_range_m": [5.0, 100.0]}}
+        good = {"lat_min": -20, "lat_max": -10, "lon_min": 120, "lon_max": 130, "groups": [["2018-04"], ["2018-03"]],
+                "analyses": ["consistency"], "variable": "salinity", "depth_min": 5, "depth_max": 100,
+                "direction": None, "extra": ""}
+        self.assertEqual(mismatches(spec, good), [])
+        cases = {"region": {"lat_min": 10, "lat_max": 20}, "groups": {"groups": [["2018-03", "2018-04"]]},
+                 "depth": {"depth_min": 0.49}, "direction": {"direction": "observation_minus_reanalysis"},
+                 "extra": {"extra": "再做密度法"}, "variable": {"variable": "potential_temperature"}}
+        for field, change in cases.items():
+            self.assertEqual(mismatches(spec, {**good, **change}), [field], field)
+        self.assertTrue(mismatches(spec, "not json")[0].startswith("unparsable"))
+
+    def test_v2_prompt_adds_conventions_and_keeps_v1(self):
+        self.assertIn("南半球冬与夏", envmod.SYSTEM_V2)
+        self.assertIn("多轮对话", envmod.SYSTEM_V2)
+        self.assertNotIn("多轮对话", envmod.SYSTEM_V1)
+        self.assertEqual(OceanLabHarness().system, envmod.SYSTEM_V1)
+        self.assertEqual(OceanLabHarness(prompt="v2").system, envmod.SYSTEM_V2)
+
+    def test_multiturn_replays_history_and_allows_handle_reuse(self):
+        consistency = {"variable": "potential_temperature", "shallow_requested": False, "depth_range_m": [5.0, 50.0]}
+        first = spec_for(self.data, [["2018-03"]], ["consistency"], consistency, sid="fake-first")
+        first_trace = run_trajectory(first, self.tok, self.lab, generator_of(self.tok, oracle_texts(first, self.lab)),
+                                     harness=OceanLabHarness(prompt="v2"))
+        final = spec_for(self.data, [["2018-03"]], ["mld", "consistency"], consistency, sid="fake-final")
+        final.update(history=first_trace["messages"][2:] + [{"role": "user", "content": "再加上混合层"}],
+                     history_calls=[c["call"] for c in first_trace["calls"]],
+                     history_handles=["ds_1", "res_1"])
+        harness = OceanLabHarness(Scorer(self.data), prompt="v2")
+        reuse = [tool_text("复用ds_1", "compute_mld", {"dataset": "ds_1", "variable": "potential_temperature",
+                                                       "qc_policy": "qc_policy_v1", "groups": [
+                                                           {"label": "3", "start_date": "2018-03-01", "end_date": "2018-03-31"}]}),
+                 '<final>{"status": "complete", "results": {"mld": "res_2", "consistency": "res_1"}}</final>']
+        trace = run_trajectory(final, self.tok, self.lab, generator_of(self.tok, reuse), harness=harness)
+        self.assertEqual(trace["metrics"]["success"], 1, trace["metrics"])
+        self.assertEqual(trace["calls"][0]["result"]["result"], "res_2")
+        prompt = self.tok.decode(trace["rounds"][0]["input_ids"])
+        self.assertIn("再加上混合层", prompt)
+        self.assertIn(envmod.SYSTEM_V2, prompt)
+        with self.assertRaises(RuntimeError):
+            harness.start({**final, "history_handles": ["ds_9", "res_1"]}, self.lab)
+
+
+def generator_of(tok, texts):
+    sequence = iter(texts)
+    return lambda ids, limit: (tok.encode(next(sequence), add_special_tokens=False) + [tok.eos_token_id], [])
+
+
 @unittest.skipUnless(HAS_SDK and (ROOT / "data/processed/oceanlab/oceanlab_dev_v1.jsonl").exists()
                      and Path("/data/anhuang/oceandepths/SOURCE_MANIFEST.json").exists(), "local OceanDepths copy required")
 class RealDevRequestTests(unittest.TestCase):
