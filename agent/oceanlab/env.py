@@ -188,6 +188,7 @@ class Episode:
     def __init__(self, lab):
         self.lab, self.data = lab, lab.data
         self.datasets, self.results, self.tables = {}, {}, {}
+        self.memory = None  # what a harness memory policy put into this episode's prompt
 
     def execute(self, call):
         try:
@@ -470,7 +471,6 @@ class OceanLabHarness(Harness):
         before the first user message (the system prompt never changes)."""
         self.scorer, self.prompt, self.memory = scorer, prompt, memory
         self.system = SYSTEMS[prompt]
-        self.last_memory = None
 
     def parse(self, text):
         """The shared ReAct parser, with a stricter final (tags required) and error messages that explain the rule
@@ -500,15 +500,14 @@ class OceanLabHarness(Harness):
             if result.get("dataset", result.get("result")) != handle:
                 raise RuntimeError(f"{task['id']}: history replay produced {result} instead of {handle}")
         question = task["text"]
-        self.last_memory = None
-        if self.memory:
+        if self.memory:  # recorded on the episode: one harness serves concurrent episodes (batched rollouts)
             preface, items = self.memory.preface(task)
             question = preface + question
-            self.last_memory = {"policy": self.memory.name, "items": items, "preface_chars": len(preface)}
+            episode.memory = {"policy": self.memory.name, "items": items, "preface_chars": len(preface)}
         return question, task.get("history", []), episode
 
     def finish(self, task, trace, episode):
         trace.update(id=task["id"], kind=task["family"], scope=episode.lab.scope, registry=episode.public_registry(),
-                     memory=self.last_memory)
+                     memory=episode.memory)
         if self.scorer:
             trace["metrics"] = self.scorer.score(task, trace)

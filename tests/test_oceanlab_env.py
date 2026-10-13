@@ -481,6 +481,142 @@ def generator_of(tok, texts):
     return lambda ids, limit: (tok.encode(next(sequence), add_special_tokens=False) + [tok.eos_token_id], [])
 
 
+@unittest.skipUnless(HAS_SDK, "optional SDK environment required")
+class BatchedRolloutTests(unittest.TestCase):
+    """Agent RL rollouts: concurrent SDK episodes served by batched generation, and the group advantages."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = AutoTokenizer.from_pretrained(ROOT / "model")
+        cls.data = FakeData(fake_profiles())
+        cls.lab = OceanLab("dev", cls.data)
+
+    def scripted_batches(self, scripts, sizes):
+        queues = {i: iter(texts) for i, texts in scripts.items()}
+
+        def generate_batch(requests):
+            sizes.append(len(requests))
+            return [self.tok.encode(next(queues[i]), add_special_tokens=False) + [self.tok.eos_token_id]
+                    for i, _, _ in requests]
+        return generate_batch
+
+    def test_batched_episodes_equal_sequential_ones(self):
+        from functools import partial
+        from trainer.oceanlab_rollout import BatchedEpisodes
+        harness = OceanLabHarness(Scorer(self.data), prompt="v2")
+        specs = [spec_for(self.data, [["2018-03"]], ["mld"], sid=f"fake-{i}") for i in range(3)]
+        scripts = {i: oracle_texts(spec, self.lab) for i, spec in enumerate(specs)}
+        scripts[1] = ["先想一想"] + scripts[1]  # one invalid action: this episode needs an extra round
+        scripts[2] = scripts[2][:1] + ['<final>{"status": "complete", "results": {}}</final>']
+        sequential = [run_trajectory(spec, self.tok, self.lab, generator_of(self.tok, scripts[i]), harness=harness)
+                      for i, spec in enumerate(specs)]
+        sizes = []
+        batched = BatchedEpisodes(self.scripted_batches(scripts, sizes)).run(
+            [partial(run_trajectory, spec, self.tok, self.lab, harness=harness) for spec in specs])
+        strip = lambda t: {**t, "rounds": [{k: v for k, v in r.items() if k not in ("seconds", "sdk_call_id")}
+                                           for r in t["rounds"]]}
+        self.assertEqual([strip(t) for t in batched], [strip(t) for t in sequential])
+        self.assertEqual(sizes[0], 3)
+        self.assertEqual(sum(sizes), sum(len(t["rounds"]) for t in sequential))
+        self.assertEqual([t["metrics"]["reward"] for t in batched], [1.0, 0.9, 0.0])  # S=1 for the second, minus 0.1 protocol
+
+    def test_an_episode_error_is_raised_after_the_others_end(self):
+        from trainer.oceanlab_rollout import BatchedEpisodes
+        finished = []
+
+        def good(generate):
+            tokens, _ = generate([1, 2], 4)
+            finished.append(tokens)
+            return tokens
+
+        def bad(generate):
+            generate([3], 4)
+            raise KeyError("episode failed")
+        with self.assertRaises(KeyError):
+            BatchedEpisodes(lambda requests: [[7]] * len(requests)).run([good, bad, good])
+        self.assertEqual(finished, [[7], [7]])
+
+    def test_concurrent_episodes_keep_their_own_memory_record(self):
+        from functools import partial
+        from agent.oceanlab.skills import SkillMemory
+        from trainer.oceanlab_rollout import BatchedEpisodes
+        skill = lambda sid: {"id": sid, "title": sid, "principle": "规则", "when": "", "evidence": []}
+        bank = {"general": [], "common_mistakes": [],
+                "task_specific": {"mld": [skill("mld-1")], "season": [skill("season-1")]}}
+        harness = OceanLabHarness(Scorer(self.data), prompt="v2", memory=SkillMemory(bank))
+        specs = [spec_for(self.data, [["2018-03"]], ["mld"], sid=f"fake-{i}") for i in range(2)]
+        specs[0]["text"], specs[1]["text"] = "算一下混合层", "冬季的情况"
+        scripts = {i: oracle_texts(spec, self.lab) for i, spec in enumerate(specs)}
+        traces = BatchedEpisodes(self.scripted_batches(scripts, [])).run(
+            [partial(run_trajectory, spec, self.tok, self.lab, harness=harness) for spec in specs])
+        self.assertEqual([t["memory"]["items"] for t in traces], [["mld-1"], ["season-1"]])
+
+    def test_skill_evolution_adds_reviewed_skills_under_caps(self):
+        from agent.oceanlab import evolve as ev
+        stats = {"mld": (30, 0.35), "season": (12, 0.55), "relative_time": (5, 0.1), "consistency": (40, 0.7)}
+        self.assertEqual(ev.weak_categories(stats, 0.6, 0.4, 10, 2), ["mld"])
+        self.assertEqual(ev.weak_categories(stats, 0.6, 0.4, 10, 2, relative=True), ["mld", "season"])
+        traces = [{"id": f"r{i}", "metrics": {"success": 0.0, "failure": kind}}
+                  for i, kind in enumerate(["parameters"] * 5 + ["status", "unknown_handle"])]
+        picked = ev.diverse_failures(traces + [{"id": "ok", "metrics": {"success": 1.0, "failure": None}}], 3, 0)
+        self.assertEqual(sorted(t["metrics"]["failure"] for t in picked), ["parameters", "status", "unknown_handle"])
+
+        class FakeTeacher:
+            def __init__(self, replies):
+                self.replies = iter(replies)
+
+            def chat(self, messages, **kwargs):
+                self.prompt = messages[-1]["content"]
+                return json.dumps(next(self.replies), ensure_ascii=False)
+        skill = lambda title: {"title": title, "principle": f"{title}的做法", "when": "", "evidence": ["r0"]}
+        bank = {"general": [], "common_mistakes": [{"id": "cm-1", "title": "旧", "principle": "旧规则 <5 m", "when": "",
+                                                    "evidence": []}], "task_specific": {"mld": []}}
+        reply = {"task_specific": [skill("甲"), skill("乙")], "common_mistakes": [skill("丙"), skill("丁"), skill("戊")]}
+        keep = {"keep": [{"index": 1}, {"index": 2, "principle": "乙的准确做法"}, {"index": 4}, {"index": 4}, {"index": 9},
+                         {"index": 5}], "removed": [{"index": 3, "reason": "重复"}]}
+        teacher = FakeTeacher([reply, keep])
+        new, log = ev.evolve(bank, "mld", [(traces[0], {})], lambda t, s: "请求：…", teacher, "", "e25")
+        self.assertEqual([s["id"] for s in new["task_specific"]["mld"]], ["e25-mld-1", "e25-mld-2"])
+        self.assertEqual([s["id"] for s in new["common_mistakes"]], ["cm-1", "e25-mld-3"])  # at most 3 new skills
+        self.assertEqual([s["title"] for s in new["common_mistakes"]], ["旧", "丁"])  # removed and repeated numbers skipped
+        self.assertEqual(new["task_specific"]["mld"][1]["principle"], "乙的准确做法")
+        self.assertEqual(bank["task_specific"]["mld"], [])  # the old version is unchanged
+        self.assertEqual(len(log["added"]), 3)
+        self.assertNotIn("<", teacher.prompt.split("新增技能")[0])  # current skills reach the teacher rendered
+        full = {**bank, "task_specific": {"mld": [{"id": f"m{i}", "title": "t", "principle": "p"} for i in range(6)]}}
+        keep_all = {"keep": [{"index": i} for i in range(1, 6)]}
+        new, log = ev.evolve(full, "mld", [(traces[0], {})], lambda t, s: "", FakeTeacher([reply, keep_all]), "", "e50")
+        self.assertEqual(len(new["task_specific"]["mld"]), 6)  # category cap reached: only common mistakes are added
+        self.assertEqual([a["level"] for a in log["added"]], ["common_mistakes"] * 3)
+
+    def test_candidate_skills_are_verified_alone(self):
+        from agent.oceanlab import evolve as ev
+        from agent.oceanlab.skills import retrieve
+        bank = {"general": [], "common_mistakes": [], "task_specific": {"mld": [{"id": "m1", "title": "a", "principle": "p"}]}}
+        trial = ev.with_skill(bank, "mld", {"title": "新", "principle": "新规则", "level": "task_specific"})
+        self.assertEqual([s["id"] for s in retrieve(trial, ["混合层"])], ["m1", "candidate"])
+        self.assertEqual(len(bank["task_specific"]["mld"]), 1)
+        baseline = {"f1": 0.0, "f2": 0.0, "s1": 1.0, "s2": 1.0}
+        self.assertEqual(ev.verdict(baseline, {"f1": 1.0, "f2": 0.0, "s1": 1.0, "s2": 1.0}), (1, 0, True))
+        self.assertEqual(ev.verdict(baseline, {"f1": 1.0, "f2": 0.0, "s1": 0.0, "s2": 1.0}), (1, 1, False))
+        self.assertEqual(ev.verdict(baseline, dict(baseline)), (0, 0, False))  # fixes nothing: not kept
+        self.assertEqual(ev.verdict(baseline, {"f1": 1.0, "f2": 1.0, "s1": 0.0, "s2": 1.0}, min_gain=2), (2, 1, True))
+        new, added = ev.add_skills(bank, "season", [{"title": "t", "principle": "p", "level": "task_specific"}] * 4, "e5")
+        self.assertEqual([a["id"] for a in added], ["e5-season-1", "e5-season-2", "e5-season-3"])
+        self.assertNotIn("season", bank["task_specific"])
+
+    def test_group_advantages(self):
+        from trainer.train_oceanlab_grpo import group_advantages
+        self.assertIsNone(group_advantages([1.0] * 8, "grpo"))
+        self.assertIsNone(group_advantages([-0.1, -0.1], "rloo"))
+        grpo = group_advantages([1.0, 0.0, 0.0, 0.0], "grpo")
+        self.assertAlmostEqual(grpo[0], 0.75 / (0.1875 ** .5 + 1e-4))
+        self.assertAlmostEqual(sum(grpo), 0.0)
+        for got, want in zip(group_advantages([1.0, 0.0, 0.0, -0.1], "rloo"),
+                             [1.0 - (-0.1 / 3), 0.0 - 0.9 / 3, 0.0 - 0.9 / 3, -0.1 - 1.0 / 3]):
+            self.assertAlmostEqual(got, want)
+
+
 @unittest.skipUnless(HAS_SDK and (ROOT / "data/processed/oceanlab/oceanlab_dev_v1.jsonl").exists()
                      and Path("/data/anhuang/oceandepths/SOURCE_MANIFEST.json").exists(), "local OceanDepths copy required")
 class RealDevRequestTests(unittest.TestCase):
