@@ -465,9 +465,12 @@ class OceanLabHarness(Harness):
     tools = TOOLS
     budget = dict(max_turns=16, max_calls=12, max_total_len=8192, max_new_tokens=512)
 
-    def __init__(self, scorer=None, prompt="v1"):
-        self.scorer, self.prompt = scorer, prompt
+    def __init__(self, scorer=None, prompt="v1", memory=None):
+        """memory: optional policy with preface(task) -> (text, item ids), e.g. skills.SkillMemory; the text is put
+        before the first user message (the system prompt never changes)."""
+        self.scorer, self.prompt, self.memory = scorer, prompt, memory
         self.system = SYSTEMS[prompt]
+        self.last_memory = None
 
     def parse(self, text):
         """The shared ReAct parser, with a stricter final (tags required) and error messages that explain the rule
@@ -496,9 +499,16 @@ class OceanLabHarness(Harness):
             result = episode.execute(call)
             if result.get("dataset", result.get("result")) != handle:
                 raise RuntimeError(f"{task['id']}: history replay produced {result} instead of {handle}")
-        return task["text"], task.get("history", []), episode
+        question = task["text"]
+        self.last_memory = None
+        if self.memory:
+            preface, items = self.memory.preface(task)
+            question = preface + question
+            self.last_memory = {"policy": self.memory.name, "items": items, "preface_chars": len(preface)}
+        return question, task.get("history", []), episode
 
     def finish(self, task, trace, episode):
-        trace.update(id=task["id"], kind=task["family"], scope=episode.lab.scope, registry=episode.public_registry())
+        trace.update(id=task["id"], kind=task["family"], scope=episode.lab.scope, registry=episode.public_registry(),
+                     memory=self.last_memory)
         if self.scorer:
             trace["metrics"] = self.scorer.score(task, trace)

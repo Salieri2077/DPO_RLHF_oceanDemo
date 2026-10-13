@@ -3,9 +3,11 @@ returns, may enter an episode's prompt, a memory, or Reflexion feedback at test 
 
 Scientific success S = 1 requires all of:
 1. a `<final>` JSON object with a valid status and a result handle for every requested analysis;
-2. each handle exists in this episode's registry, was made by the right tool, and its normalised computation matches
-   the request: region, the set of group date coverages (labels and order are ignored), variable, method card (QC
-   policy qc_policy_v1; nearest_or_exact for consistency) and the actual depth-level set;
+2. each delivered handle exists in this episode's registry, was made by the right tool, and its normalised computation
+   matches the request: region, variable, method card (QC policy qc_policy_v1; nearest_or_exact for consistency) and
+   the actual depth-level set; the groups of the handles delivered for an analysis (one handle, a list, or a
+   {label: handle} map, e.g. one per period from separate queries) together equal the requested group date coverages
+   exactly (labels and order are ignored);
 3. the declared status equals the reference status. Insufficient support is judged on valid support (estimable
    profiles; pairs per group x level), and a refusal counts only with the formal handles that show zero support, so
    refusing without querying fails, and query errors, partition refusals or budget exhaustion are never evidence.
@@ -60,20 +62,44 @@ def expected_params(spec, depth):
     return out
 
 
-def parameter_errors(record, want):
-    """Names of the computation parameters of a handle that differ from the request (normalised semantics)."""
-    p = record["params"]
+def parameter_errors(record, want, records=None):
+    """Names of the computation parameters that differ from the request (normalised semantics).
+
+    `records` (all handles delivered for one analysis, default just `record`): an analysis may be delivered as several
+    handles, e.g. one per period computed from separate queries; every handle must match the request on everything
+    but groups, and their groups together must cover the requested groups exactly (no gap, no repeat)."""
+    records = records or [record]
     errors = []
-    if any(not close(p["region"][k], want["region"][k]) for k in want["region"]):
+    if any(not close(r["params"]["region"][k], want["region"][k]) for r in records for k in want["region"]):
         errors.append("region")
-    if sorted((g["start_date"], g["end_date"]) for g in p["groups"]) != want["coverage"]:
+    if sorted((g["start_date"], g["end_date"]) for r in records for g in r["params"]["groups"]) != want["coverage"]:
         errors.append("groups")
+    for record in records:
+        for error in _method_errors(record["params"], want):
+            if error not in errors:
+                errors.append(error)
+    return errors
+
+
+def _method_errors(p, want):
+    errors = []
     for key in ("variable", "qc_policy", "temporal_filter"):
         if key in want and p.get(key) != want[key]:
             errors.append(key)
     if "levels" in want and sorted(p["levels"]) != sorted(want["levels"]):
         errors.append("levels")
     return errors
+
+
+def delivered_handles(value):
+    """A result entry of <final>: one handle, a list of handles, or {label: handle}. -> list of handles or None."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and value and all(isinstance(v, str) for v in value):
+        return value
+    if isinstance(value, dict) and value and all(isinstance(v, str) for v in value.values()):
+        return list(value.values())
+    return None
 
 
 def compare_groups(tool, stored, ref):
@@ -113,8 +139,8 @@ def parse_final(text):
     if not isinstance(final, dict) or final.get("status") not in STATUSES:
         return None, "final needs an object with status complete/partial/insufficient"
     results = final.get("results")
-    if not isinstance(results, dict) or not all(isinstance(v, str) for v in results.values()):
-        return None, "final needs results: {analysis: handle}"
+    if not isinstance(results, dict) or any(delivered_handles(v) is None for v in results.values()):
+        return None, "final needs results: {analysis: handle or handles}"
     return final, None
 
 
@@ -138,11 +164,12 @@ class Scorer:
             problems += [f"{handle} {p}" for p in compare_groups(record["tool"], record["groups"], ref)]
         return problems
 
-    def score(self, task, trace):
+    def score(self, task, trace, env_problems=None):
+        """env_problems: reuse an earlier self-check of the same trace (rescoring after a delivery-rule change)."""
         reference_status = task["reference"]["status"]
-        protocol = [r for r in trace["rounds"] if r.get("action", {}).get("type") == "invalid"]
+        protocol = [r for r in trace["rounds"] if (r.get("action") or {}).get("type") == "invalid"]
         protocol += [c for c in trace["calls"] if c["result"].get("error_kind") == "schema"]
-        env_problems = self.self_check(trace)
+        env_problems = self.self_check(trace) if env_problems is None else env_problems
         registry = trace["registry"]["results"]
         failure, params, declared, final_error = None, {}, None, None
         if trace["stop"] != "final":
@@ -155,15 +182,15 @@ class Scorer:
                 declared = final["status"]
                 want = expected_params(task, self.data.depth)
                 for analysis, target in want.items():
-                    handle = final["results"].get(analysis)
-                    if handle is None:
+                    handles = delivered_handles(final["results"].get(analysis))
+                    if handles is None:
                         failure = failure or "missing_analysis"
-                    elif handle not in registry:
+                    elif any(h not in registry for h in handles):
                         failure = failure or "unknown_handle"
-                    elif registry[handle]["tool"] != TOOL_OF[analysis]:
+                    elif any(registry[h]["tool"] != TOOL_OF[analysis] for h in handles):
                         failure = failure or "wrong_tool"
                     else:
-                        errors = parameter_errors(registry[handle], target)
+                        errors = parameter_errors(None, target, [registry[h] for h in handles])
                         if errors:
                             params[analysis] = errors
                             failure = failure or "parameters"
@@ -184,7 +211,7 @@ class Scorer:
             "stop": trace["stop"], "turns": len(rounds), "calls": len(trace["calls"]),
             "tool_errors": sum("error" in c["result"] for c in trace["calls"]),
             "diagnostic_handles": sum(1 for r in registry.values() if not r["method_card"]),
-            "input_tokens": sum(len(r["input_ids"]) for r in rounds),
+            "input_tokens": sum(len(r["input_ids"]) if "input_ids" in r else r["input_tokens"] for r in rounds),
             "generated_tokens": sum(len(r["completion_ids"]) for r in rounds),
         }
 

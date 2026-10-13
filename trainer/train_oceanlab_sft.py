@@ -50,7 +50,8 @@ class TurnSamples(torch.utils.data.Dataset):
             if messages[0] != {"role": "system", "content": harness.system}:
                 raise ValueError(f"{row['id']}: demonstration was made with a different system prompt")
             for i, message in enumerate(messages):
-                if message["role"] != "assistant":
+                # supervision_start: earlier turns (e.g. a multiturn task's answered first turn) are context only
+                if message["role"] != "assistant" or i < row.get("supervision_start", 0):
                     continue
                 prompt = harness.prompt_ids(tokenizer, messages[:i])
                 target = tokenizer.encode(message["content"], add_special_tokens=False) + [tokenizer.eos_token_id]
@@ -86,6 +87,7 @@ def parser():
     p.add_argument("--prompt", choices=["v1", "v2"], default="v1", help="environment system prompt the demos were rendered with")
     p.add_argument("--demos", type=Path, default=DEMOS)
     p.add_argument("--subset", type=int, required=True, help="train on demonstrations with rank < subset")
+    p.add_argument("--init_adapter", type=Path, help="continue training this LoRA adapter (e.g. C1 on top of C0)")
     p.add_argument("--save_adapter", required=True, help="adapter name under out/hf/ (writes <name>_final)")
     p.add_argument("--run_name", required=True)
     p.add_argument("--epochs", type=int, default=3)
@@ -130,12 +132,15 @@ def main():
     train = TurnSamples(train_rows, tokenizer, args.max_len, args.prompt)
     holdout = TurnSamples(holdout_rows, tokenizer, args.max_len, args.prompt)
 
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=torch.float16).to(device)
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.enable_input_require_grads()
-    model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
-                                             target_modules=LORA_TARGETS, task_type="CAUSAL_LM"))
+    if args.init_adapter:
+        model = PeftModel.from_pretrained(model, args.init_adapter, is_trainable=True)
+    else:
+        model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+                                                 target_modules=LORA_TARGETS, task_type="CAUSAL_LM"))
     for parameter in model.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
@@ -156,6 +161,7 @@ def main():
                   demos_sha256=file_hash(args.demos), env_sha256=file_hash(ROOT / "agent/oceanlab/env.py"),
                   chat_template_sha256=hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
                   model_config_sha256=file_hash(args.model_path / "config.json"),
+                  init_adapter_sha256=file_hash(args.init_adapter / "adapter_model.safetensors") if args.init_adapter else None,
                   trainable_parameters=sum(p.numel() for p in trainable), dtype="float16 base, float32 LoRA",
                   attention="sdpa, KV heads expanded (memory-efficient kernel)",
                   train_target_tokens=sum(len(ids) - start for ids, start in train.samples),

@@ -117,7 +117,8 @@ class OceanModel(Model):
         if len(ids) + limit > self.budget["max_total_len"]:
             self.stop("context_limit")
         started = time.monotonic()
-        tokens, logps = self.generate(ids, limit)
+        # A policy that works on chat messages (an API teacher) sets wants_messages; it still returns token ids.
+        tokens, logps = self.generate(messages if getattr(self.generate, "wants_messages", False) else ids, limit)
         text = self.tokenizer.decode(tokens, skip_special_tokens=False).replace(self.tokenizer.eos_token, "").strip()
         entry = dict(input_ids=ids, completion_ids=tokens, old_logps=logps, text=text,
                      seconds=time.monotonic() - started)

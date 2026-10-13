@@ -57,15 +57,25 @@ def run_shard(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # minimind: the agent template all our tool SFT used; native: the Instruct model's own template (non-thinking).
     tokenizer = agent_tokenizer(args.model_path) if args.chat_template == "minimind" else native_tokenizer(args.model_path, False)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=torch.float16).to(device)
-    model.generation_config.pad_token_id = tokenizer.eos_token_id
-    if args.adapter:
-        model = PeftModel.from_pretrained(model, args.adapter)
-    model.eval()
-    lab = OceanLab("dev")
-    harness = OceanLabHarness(Scorer(lab.data), prompt=args.prompt)
-    greedy = model_generator(model, tokenizer, device, sample=False, save_logps=False)
-    sampled = model_generator(model, tokenizer, device, sample=True, save_logps=False)
+    lab = OceanLab(args.scope)
+    memory = None
+    if args.skills:  # SkillBank retrieved into a preface of the first user message
+        from agent.oceanlab.skills import SkillMemory, load
+        memory = SkillMemory(load(args.skills))
+    harness = OceanLabHarness(Scorer(lab.data), prompt=args.prompt, memory=memory)
+    if args.teacher:  # an API model as the agent; the local tokenizer only frames its replies as token ids
+        from agent.oceanlab.teacher import Teacher, TeacherPolicy
+        teacher = Teacher(args.out / "teacher_cache" / f"{index}.jsonl", model=args.teacher)
+        greedy = TeacherPolicy(teacher, tokenizer, harness, temperature=0.0)
+        sampled = TeacherPolicy(teacher, tokenizer, harness, temperature=1.0)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=torch.float16).to(device)
+        model.generation_config.pad_token_id = tokenizer.eos_token_id
+        if args.adapter:
+            model = PeftModel.from_pretrained(model, args.adapter)
+        model.eval()
+        greedy = model_generator(model, tokenizer, device, sample=False, save_logps=False)
+        sampled = model_generator(model, tokenizer, device, sample=True, save_logps=False)
     budget = {k: getattr(args, k) for k in BUDGET}
     path = args.out / "shards" / f"{index}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +95,9 @@ def run_shard(args):
                 m = trace["metrics"]
                 print(f"{spec['id']} s{sample} S={m['success']:.0f} r={m['reward']:.1f} {m['failure']} stop={m['stop']} "
                       f"turns={m['turns']} calls={m['calls']} gen={m['generated_tokens']} {trace['seconds']}s", flush=True)
+                if args.teacher:
+                    (args.out / f"teacher_usage_{index}.json").write_text(json.dumps(
+                        {**teacher.usage, "cost_cny": teacher.cost()}, indent=1))
 
 
 def summarize(traces, requests=None):
@@ -164,6 +177,9 @@ def main():
     p.add_argument("--adapter", type=Path, help="LoRA adapter directory (omit for the bare model)")
     p.add_argument("--chat_template", choices=["minimind", "native"], default="minimind")
     p.add_argument("--prompt", choices=["v1", "v2"], default="v1", help="environment system prompt (v2 for request set v2)")
+    p.add_argument("--scope", choices=["dev", "train"], default="dev", help="environment partition of the requests")
+    p.add_argument("--teacher", help="SiliconFlow model id to act as the agent instead of a local model")
+    p.add_argument("--skills", type=Path, help="SkillBank JSON to retrieve into the prompt (memory policy 'skills')")
     p.add_argument("--requests", type=Path, default=REQUESTS)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--samples", type=int, default=8)
@@ -177,6 +193,8 @@ def main():
         return merge(args)
     args.out.mkdir(parents=True, exist_ok=True)
     config = {"model_path": str(args.model_path), "chat_template": args.chat_template, "prompt": args.prompt,
+              "scope": args.scope, "teacher": args.teacher, "skills": str(args.skills) if args.skills else None,
+              "skills_sha256": file_hash(args.skills) if args.skills else None,
               "model_config_sha256": file_hash(args.model_path / "config.json"),
               "adapter": str(args.adapter) if args.adapter else None,
               "adapter_sha256": file_hash(args.adapter / "adapter_model.safetensors") if args.adapter else None,

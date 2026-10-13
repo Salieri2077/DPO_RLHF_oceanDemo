@@ -82,3 +82,38 @@ class Teacher:
                 error = exc
             time.sleep(wait * random.uniform(1, 1.3))
         raise RuntimeError(f"teacher call failed after {attempts} attempts: {error}")
+
+
+class TeacherPolicy:
+    """An API model acting as the agent inside the SDK harness (teacher check, teacher demonstrations).
+
+    It receives exactly the information the local model gets: the system prompt with the tool section as the chat
+    template renders it, the conversation, and tool results wrapped in <tool_response> as Qwen's template does. Its
+    reply is returned as token ids of the agent tokenizer plus the end-of-turn token, so traces look like any other.
+    """
+    wants_messages = True
+
+    def __init__(self, teacher, tokenizer, harness, temperature=0.0):
+        self.teacher, self.tokenizer, self.temperature = teacher, tokenizer, temperature
+        rendered = tokenizer.apply_chat_template([{"role": "system", "content": harness.system}], tools=harness.tools,
+                                                 tokenize=False)
+        start, end = "<|im_start|>system\n", "<|im_end|>"
+        if not rendered.startswith(start) or end not in rendered:
+            raise ValueError("unexpected chat template rendering of the system turn")
+        self.system = rendered[len(start):rendered.index(end)]
+
+    def messages(self, conversation):
+        out = [{"role": "system", "content": self.system}]
+        for message in conversation[1:]:
+            role, content = message["role"], message["content"]
+            if role == "tool":
+                role, content = "user", f"<tool_response>\n{content}\n</tool_response>"
+            if out[-1]["role"] == role == "user":
+                out[-1]["content"] += "\n" + content
+            else:
+                out.append({"role": role, "content": content})
+        return out
+
+    def __call__(self, conversation, limit):
+        text = self.teacher.chat(self.messages(conversation), temperature=self.temperature, max_tokens=limit)
+        return self.tokenizer.encode(text.strip(), add_special_tokens=False) + [self.tokenizer.eos_token_id], []

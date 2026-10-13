@@ -216,6 +216,21 @@ class FakeEnvironmentTests(unittest.TestCase):
                                     self.final("partial", mld="res_1")])
         self.assertEqual(trace["metrics"]["parameter_errors"], {"mld": ["groups"]})
 
+    def test_an_analysis_may_be_delivered_as_several_handles(self):
+        spec = spec_for(self.data, [["2018-03"], ["2018-04"]], ["mld"])
+        march = [{"label": "3", "start_date": "2018-03-01", "end_date": "2018-03-31"}]
+        april = [{"label": "4", "start_date": "2018-04-01", "end_date": "2018-04-30"}]
+        steps = [self.query("2018-03-01", "2018-04-30"), self.mld(march), self.mld(april)]
+        for results, ok, failure in (({"mld": ["res_1", "res_2"]}, 1, None),
+                                     ({"mld": {"三月": "res_1", "四月": "res_2"}}, 1, None),
+                                     ({"mld": ["res_1"]}, 0, "parameters"),            # April missing
+                                     ({"mld": ["res_1", "res_1", "res_2"]}, 0, "parameters"),  # March twice
+                                     ({"mld": []}, 0, "final_format")):
+            final = "<final>" + json.dumps({"status": "partial", "results": results}) + "</final>"
+            metrics = self.episode(spec, steps + [final])["metrics"]
+            self.assertEqual((metrics["success"], metrics["failure"]), (ok, failure), results)
+        self.assertEqual(spec["reference"]["status"], "partial")
+
     def test_diagnostic_on_the_way_is_allowed_but_not_as_delivery(self):
         spec = spec_for(self.data, [["2018-03"]], ["mld"])
         march = [{"label": "3", "start_date": "2018-03-01", "end_date": "2018-03-31"}]
@@ -440,6 +455,25 @@ class RequestSetV2Tests(unittest.TestCase):
         self.assertIn(envmod.SYSTEM_V2, prompt)
         with self.assertRaises(RuntimeError):
             harness.start({**final, "history_handles": ["ds_9", "res_1"]}, self.lab)
+
+    def test_skill_preface_is_retrieved_and_removable(self):
+        from agent.oceanlab.skills import SkillMemory
+        skill = lambda sid, text: {"id": sid, "title": sid, "principle": text, "when": "", "evidence": []}
+        bank = {"general": [skill("g-1", "先查询再计算")], "common_mistakes": [skill("cm-1", "深度 <5.078 m 不算")],
+                "task_specific": {"mld": [skill("mld-1", "混合层按月分组")], "season": [skill("season-1", "季节按半球")],
+                                  "consistency": [skill("con-1", "看偏差方向")]}}
+        spec = spec_for(self.data, [["2018-03"]], ["mld"])
+        spec["text"] = "请算一下这个区域冬季的混合层"
+        harness = OceanLabHarness(Scorer(self.data), prompt="v2", memory=SkillMemory(bank))
+        trace = run_trajectory(spec, self.tok, self.lab, generator_of(self.tok, oracle_texts(spec, self.lab)),
+                               harness=harness)
+        self.assertEqual(trace["memory"]["items"], ["g-1", "mld-1", "season-1", "cm-1"])
+        first = trace["messages"][1]["content"]
+        preface = first[:trace["memory"]["preface_chars"]]
+        self.assertEqual(first[len(preface):], spec["text"])
+        self.assertNotIn("<", preface)
+        self.assertIn("小于5.078", preface)
+        self.assertEqual(trace["messages"][0]["content"], envmod.SYSTEM_V2)
 
 
 def generator_of(tok, texts):
