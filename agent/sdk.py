@@ -1,6 +1,13 @@
 """Local OceanHeart Model adapter. The OpenAI SDK Runner owns the execution loop.
 
 No hosted models, network tracing, handoffs, or answer repair. One adapter per run.
+
+The environment (system prompt, tool list, prompt construction, action parsing, observation rendering, per-episode
+executor and scorer) is a pluggable Harness. The prompt is always built from the harness's own `system` and `tools`,
+so a new environment cannot silently inherit the old ones. The default, REACT, is the v3.1 ocean ReAct environment:
+the same SYSTEM, TOOLS and template call as `agent.react.messages_for` / `agent.ocean.prompt_ids`, so it reproduces
+the earlier hard-wired adapter token for token (scripts/sdk_regression.py). `agent/ocean.py` and `agent/react.py`
+stay untouched because data manifests pin their hashes.
 """
 import asyncio
 import copy
@@ -15,8 +22,8 @@ from agents.tracing import set_trace_provider
 from agents.tracing.provider import DefaultTraceProvider
 from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
 
-from agent.ocean import TOOLS, observation, prompt_ids
-from agent.react import SYSTEM, ScenarioTools, messages_for, parse_action, score
+from agent.ocean import TOOLS, observation
+from agent.react import SYSTEM, ScenarioTools, parse_action, score
 
 VERSION = "ocean-openai-agents-v1"
 ERROR_TOOL = "_ocean_protocol_error"
@@ -25,18 +32,59 @@ ERROR_TOOL = "_ocean_protocol_error"
 set_trace_provider(DefaultTraceProvider())
 
 
+class Harness:
+    """Everything environment-specific the adapter needs. Subclasses override the pieces they change."""
+    system = SYSTEM
+    tools = TOOLS
+    budget = dict(max_turns=6, max_calls=4, max_total_len=2048, max_new_tokens=192)
+
+    def messages(self, question, history):
+        return [{"role": "system", "content": self.system}, {"role": "user", "content": question}, *copy.deepcopy(history)]
+
+    def prompt_ids(self, tokenizer, messages):
+        """The model's actual input: these messages with this harness's tool list in the chat template."""
+        return tokenizer.apply_chat_template(messages, tools=self.tools, tokenize=True,
+                                             add_generation_prompt=True, open_thinking=False)
+
+    def parse(self, text):
+        return parse_action(text)
+
+    def observe(self, result, tokenizer):
+        """Text the model sees for a tool result (JSON)."""
+        return observation(result, tokenizer)
+
+    def trace_fields(self):
+        """Extra keys for a new trace."""
+        return {}
+
+    def start(self, task, environment):
+        """-> (question, history, per-episode executor with .execute(call))."""
+        public = task.get("public", {})
+        return task["question"], public.get("history", []), ScenarioTools(environment, transient=public.get("transient", False))
+
+    def finish(self, task, trace, executor):
+        trace.update(id=task["id"], kind=task["kind"])
+        trace["metrics"] = score(task, trace)
+
+
+REACT = Harness()
+
+
 class BudgetStop(Exception):
     pass
 
 
 class OceanModel(Model):
-    def __init__(self, question, tokenizer, environment, generate, history, budget, save):
+    def __init__(self, question, tokenizer, environment, generate, history, budget, save, harness=REACT):
         self.tokenizer, self.environment, self.generate = tokenizer, environment, generate
-        self.budget, self.save = budget, save
-        self.initial = messages_for(question, history)
+        self.budget, self.save, self.harness = budget, save, harness
+        self.initial = harness.messages(question, history)
+        if self.initial[0] != {"role": "system", "content": harness.system}:
+            raise ValueError("harness messages must start with the harness's own system prompt")
         self.raw = {}
         self.trace = dict(messages=copy.deepcopy(self.initial), rounds=[], calls=[], final="",
-                          stop="running", unrecovered_error=False, duplicates={}, runtime=VERSION)
+                          stop="running", unrecovered_error=False, duplicates={}, runtime=VERSION,
+                          **harness.trace_fields())
 
     def stop(self, reason):
         self.trace["stop"] = reason
@@ -49,7 +97,7 @@ class OceanModel(Model):
                            handoffs, tracing, **kwargs):
         if handoffs or output_schema or any(kwargs.get(k) for k in ("previous_response_id", "conversation_id", "prompt")):
             raise ValueError("Local adapter does not support hosted state, handoffs or output schemas")
-        if system_instructions != SYSTEM:
+        if system_instructions != self.harness.system:
             raise ValueError("Use the checkpoint's OceanHeart system instructions")
         # Rebuild the actual model prefix from SDK history, retaining original generated text.
         items = [{"role": "user", "content": input}] if isinstance(input, str) else input
@@ -64,12 +112,13 @@ class OceanModel(Model):
             else:
                 raise ValueError("Unexpected SDK history item; refusing lossy prompt conversion")
         self.trace["messages"] = messages
-        ids = prompt_ids(self.tokenizer, messages)
+        ids = self.harness.prompt_ids(self.tokenizer, messages)
         limit = self.budget["max_new_tokens"]
         if len(ids) + limit > self.budget["max_total_len"]:
             self.stop("context_limit")
         started = time.monotonic()
-        tokens, logps = self.generate(ids, limit)
+        # A policy that works on chat messages (an API teacher) sets wants_messages; it still returns token ids.
+        tokens, logps = self.generate(messages if getattr(self.generate, "wants_messages", False) else ids, limit)
         text = self.tokenizer.decode(tokens, skip_special_tokens=False).replace(self.tokenizer.eos_token, "").strip()
         entry = dict(input_ids=ids, completion_ids=tokens, old_logps=logps, text=text,
                      seconds=time.monotonic() - started)
@@ -81,10 +130,10 @@ class OceanModel(Model):
         messages.append({"role": "assistant", "content": text})
         error = None
         try:
-            action = parse_action(text)
+            action = self.harness.parse(text)
             if action["type"] == "tool":
                 json.dumps(action["call"], allow_nan=False)
-                if action["call"]["name"] not in [t["function"]["name"] for t in TOOLS]:
+                if action["call"]["name"] not in [t["function"]["name"] for t in self.harness.tools]:
                     raise ValueError("未知工具")
         except (ValueError, TypeError, RecursionError) as exc:
             error = str(exc)[:160]
@@ -125,7 +174,7 @@ class OceanModel(Model):
                 result = {"error": "repeated_failed_call: change arguments or clarify", "retryable": False}
             else:
                 result = self.environment.execute(call)
-            result = json.loads(observation(result, self.tokenizer))
+            result = json.loads(self.harness.observe(result, self.tokenizer))
             self.trace["calls"].append({"call": call, "result": result})
             self.trace["unrecovered_error"] = "error" in result
             content = json.dumps(result, ensure_ascii=False)
@@ -139,19 +188,23 @@ class OceanModel(Model):
                             on_invoke_tool=invoke, strict_json_schema=False)
 
 
-def run(question, tokenizer, environment, generate, *, history=(), max_turns=6, max_calls=4,
-        max_total_len=2048, max_new_tokens=192, save=None):
-    """Synchronous entry for existing evaluation workers; no custom model/tool loop."""
-    budget = dict(max_turns=max_turns, max_calls=max_calls, max_total_len=max_total_len, max_new_tokens=max_new_tokens)
+def run(question, tokenizer, environment, generate, *, history=(), max_turns=None, max_calls=None,
+        max_total_len=None, max_new_tokens=None, save=None, harness=REACT):
+    """Synchronous entry for existing evaluation workers; no custom model/tool loop.
+
+    Budgets left as None take the harness defaults (the v3.1 defaults are 6 turns, 4 calls, 2048/192 tokens).
+    """
+    given = dict(max_turns=max_turns, max_calls=max_calls, max_total_len=max_total_len, max_new_tokens=max_new_tokens)
+    budget = {k: harness.budget[k] if v is None else v for k, v in given.items()}
     if min(budget.values()) < 1:
         raise ValueError("budgets must be positive")
-    model = OceanModel(question, tokenizer, environment, generate, history, budget, save)
-    tools = [model.tool(f["name"], f["description"], f["parameters"]) for f in (t["function"] for t in TOOLS)]
+    model = OceanModel(question, tokenizer, environment, generate, history, budget, save, harness)
+    tools = [model.tool(f["name"], f["description"], f["parameters"]) for f in (t["function"] for t in harness.tools)]
     # Internal error transport only, never included in the local model's tool prompt.
     tools.append(model.tool(ERROR_TOOL, "Protocol error feedback", {"type": "object", "properties": {"error": {"type": "string"}}}))
-    agent = Agent(name="OceanHeart", instructions=SYSTEM, model=model, tools=tools)
+    agent = Agent(name="OceanHeart", instructions=harness.system, model=model, tools=tools)
     try:
-        asyncio.run(Runner.run(agent, question, max_turns=max_turns,
+        asyncio.run(Runner.run(agent, question, max_turns=budget["max_turns"],
                               run_config=RunConfig(tracing_disabled=True)))
     except MaxTurnsExceeded:
         model.trace["stop"] = "turn_limit"
@@ -167,10 +220,8 @@ def run(question, tokenizer, environment, generate, *, history=(), max_turns=6, 
     return model.trace
 
 
-def run_trajectory(task, tokenizer, environment, generate, **kwargs):
-    public = task.get("public", {})
-    env = ScenarioTools(environment, transient=public.get("transient", False))
-    trace = run(task["question"], tokenizer, env, generate, history=public.get("history", []), **kwargs)
-    trace.update(id=task["id"], kind=task["kind"])
-    trace["metrics"] = score(task, trace)
+def run_trajectory(task, tokenizer, environment, generate, harness=REACT, **kwargs):
+    question, history, executor = harness.start(task, environment)
+    trace = run(question, tokenizer, executor, generate, history=history, harness=harness, **kwargs)
+    harness.finish(task, trace, executor)
     return trace

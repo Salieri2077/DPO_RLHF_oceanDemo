@@ -56,6 +56,16 @@ class SDKTests(unittest.TestCase):
                 self.assertEqual(a[key], b[key])
         self.assertEqual(sdk['rounds'][1]['input_ids'], prompt_ids(self.tok, sdk['messages'][:-1]))
 
+    def test_default_harness_is_the_v31_prompt(self):
+        from agent.ocean import TOOLS
+        from agent.react import SYSTEM, messages_for
+        from agent.sdk import REACT
+        history = [{'role': 'assistant', 'content': '<clarify>速度是多少？</clarify>'}, {'role': 'user', 'content': '12 km/h'}]
+        self.assertEqual((REACT.system, REACT.tools), (SYSTEM, TOOLS))
+        messages = REACT.messages('求航程', history)
+        self.assertEqual(messages, messages_for('求航程', history))
+        self.assertEqual(REACT.prompt_ids(self.tok, messages), prompt_ids(self.tok, messages))
+
     def test_errors_budgets_and_retry(self):
         for bad in ('<tool_call>{}', '<tool_call>{"name":"shell","arguments":{}}</tool_call>',
                     CALL.replace('12', 'NaN'), CALL.replace('"distance"', '[]')):
