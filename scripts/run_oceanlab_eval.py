@@ -8,10 +8,16 @@ the run shows how much context, generation and how many calls the model actually
 Sharding: `--shard i/n` processes requests[i::n] into <out>/shards/i.jsonl (one GPU per process); `--merge` combines
 the shards into <out>/episodes.jsonl and <out>/summary.json. Saved traces keep each round's token counts, completion
 ids and text, but not the prompt ids (rebuildable from the messages).
+
+`--batch N` (local models) runs N episodes at once with batched generation (trainer/oceanlab_rollout.py): first the
+greedy episodes of N requests at a time, then each request's samples together. Greedy episodes are token-identical to
+the sequential ones; samples come from the same distribution but not from the per-episode seeds, and an episode's
+`seconds` is its wall time inside the batch.
 """
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -80,6 +86,8 @@ def run_shard(args):
     path = args.out / "shards" / f"{index}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     done = {(t["id"], t["sample"]) for t in read_jsonl(path)} if path.exists() else set()
+    if args.batch and not args.teacher:
+        return run_batched(args, requests, done, path, tokenizer, model, device, lab, harness, budget)
     with path.open("a", encoding="utf-8") as f:
         for spec in requests:
             for sample in range(-1, args.samples):  # -1 is the greedy episode
@@ -98,6 +106,38 @@ def run_shard(args):
                 if args.teacher:
                     (args.out / f"teacher_usage_{index}.json").write_text(json.dumps(
                         {**teacher.usage, "cost_cny": teacher.cost()}, indent=1))
+
+
+def run_batched(args, requests, done, path, tokenizer, model, device, lab, harness, budget):
+    import torch
+    from functools import partial
+    from agent.sdk import run_trajectory
+    from trainer.oceanlab_rollout import BatchedEpisodes, hf_batch_generator
+
+    def episode(spec, generate):
+        started = time.monotonic()
+        trace = run_trajectory(spec, tokenizer, lab, generate, harness=harness, **budget)
+        trace["seconds"] = round(time.monotonic() - started, 1)
+        return trace
+    todo = [(spec, -1) for spec in requests if (spec["id"], -1) not in done]
+    chunks = [todo[i:i + args.batch] for i in range(0, len(todo), args.batch)]  # greedy: N requests at a time
+    for spec in requests:  # samples: one request's samples together
+        missing = [(spec, s) for s in range(args.samples) if (spec["id"], s) not in done]
+        chunks += [missing[i:i + args.batch] for i in range(0, len(missing), args.batch)]
+    generators = {sample: hf_batch_generator(model, tokenizer, device, sample, args.token_budget) for sample in (False, True)}
+    with path.open("a", encoding="utf-8") as f:
+        for chunk in chunks:
+            torch.manual_seed(seed_of(chunk[0][0]["id"], chunk[0][1]))
+            traces = BatchedEpisodes(generators[chunk[0][1] >= 0]).run([partial(episode, spec) for spec, _ in chunk])
+            for (spec, sample), trace in zip(chunk, traces):
+                seconds = trace["seconds"]
+                trace = compact(trace)
+                trace.update(sample=sample, seconds=seconds)
+                f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+                m = trace["metrics"]
+                print(f"{spec['id']} s{sample} S={m['success']:.0f} r={m['reward']:.1f} {m['failure']} stop={m['stop']} "
+                      f"turns={m['turns']} calls={m['calls']} gen={m['generated_tokens']} {seconds}s", flush=True)
+            f.flush()
 
 
 def summarize(traces, requests=None):
@@ -177,7 +217,8 @@ def main():
     p.add_argument("--adapter", type=Path, help="LoRA adapter directory (omit for the bare model)")
     p.add_argument("--chat_template", choices=["minimind", "native"], default="minimind")
     p.add_argument("--prompt", choices=["v1", "v2"], default="v1", help="environment system prompt (v2 for request set v2)")
-    p.add_argument("--scope", choices=["dev", "train"], default="dev", help="environment partition of the requests")
+    p.add_argument("--scope", choices=["dev", "train", "test", "test-spatial"], default="dev",
+                   help="environment partition of the requests")
     p.add_argument("--teacher", help="SiliconFlow model id to act as the agent instead of a local model")
     p.add_argument("--skills", type=Path, help="SkillBank JSON to retrieve into the prompt (memory policy 'skills')")
     p.add_argument("--requests", type=Path, default=REQUESTS)
@@ -186,6 +227,8 @@ def main():
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--shard", default="0/1")
     p.add_argument("--merge", action="store_true")
+    p.add_argument("--batch", type=int, default=0, help="episodes generated together (0 = one at a time)")
+    p.add_argument("--token_budget", type=int, default=32768, help="--batch: KV-cache bound per generation sub-batch")
     for key, value in BUDGET.items():
         p.add_argument(f"--{key}", type=int, default=value)
     args = p.parse_args()
@@ -200,6 +243,8 @@ def main():
               "adapter_sha256": file_hash(args.adapter / "adapter_model.safetensors") if args.adapter else None,
               "requests": str(args.requests), "requests_sha256": file_hash(args.requests), "limit": args.limit,
               "samples": args.samples, "temperature": 1.0, "budget": {k: getattr(args, k) for k in BUDGET},
+              "generation": f"batched {args.batch}, token budget {args.token_budget}" if args.batch and not args.teacher
+              else "sequential",
               "attention": "sdpa, KV heads expanded (memory-efficient kernel)",
               "sdk_sha256": file_hash(ROOT / "agent/sdk.py"), "env_sha256": file_hash(ROOT / "agent/oceanlab/env.py"),
               "scoring_sha256": file_hash(ROOT / "agent/oceanlab/scoring.py"),
@@ -207,7 +252,10 @@ def main():
     path = args.out / "config.json"
     if path.exists() and json.loads(path.read_text()) != config:
         raise ValueError(f"{path} differs from this run's configuration; use a new --out")
-    path.write_text(json.dumps(config, indent=1))
+    # Shards start together: write atomically, so another shard never reads a half-written file.
+    temp = path.with_suffix(f".{os.getpid()}.tmp")
+    temp.write_text(json.dumps(config, indent=1))
+    temp.replace(path)
     run_shard(args)
 
 

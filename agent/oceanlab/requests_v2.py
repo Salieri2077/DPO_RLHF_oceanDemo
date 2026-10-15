@@ -17,7 +17,7 @@ import random
 import numpy as np
 import pandas as pd
 
-from agent.oceanlab.data import QC_POLICY, REVISION
+from agent.oceanlab.data import QC_POLICY, REVISION, partition_of
 from agent.oceanlab.tasks import block_box, dev_blocks, month_zh, split_months
 
 TYPE_SHARE = {"paraphrase": .5, "reasoning": .25, "multiturn": .25}
@@ -42,6 +42,12 @@ TONES = ["简短口语，像在即时通讯里随手发的", "正式书面，像
          "有点着急，语气直接", "分条列出要点", "中英混杂，夹杂 MLD、bias、RMSE、Argo、GLORYS 等英文术语",
          "客气礼貌、句子偏长", "像在组会上口头布置任务"]
 COORDINATE_STYLES = ["degree_letters", "spoken", "signed", "center", "short_zh", "english"]
+# Held out for the test sets (M5): half of the test requests are written in styles no training or dev request used.
+TEST_PERSONAS = ["航运公司的航线规划人员", "保险公司做海洋灾害风险的分析师", "环保组织的数据志愿者", "海洋牧场的养殖技术员",
+                 "极地考察队的随队观测员", "中学地理老师（带学生做课题）"]
+TEST_TONES = ["非常简略，像在搜索框里打关键词", "像语音转写的文字，口头禅多、标点随意", "先抱怨一句之前结果不对，再提新需求",
+              "以问题清单的形式提问"]
+TEST_COORDINATE_STYLES = ["zh_numerals"]
 
 
 def _ns(v):
@@ -50,6 +56,19 @@ def _ns(v):
 
 def _ew(v):
     return f"{'东经' if v >= 0 else '西经'}{abs(v):g}"
+
+
+def zh_number(n):
+    """Integer 0-199 in Chinese numerals (二十九, 一百一十)."""
+    digits = "零一二三四五六七八九"
+    if n < 10:
+        return digits[n]
+    if n < 20:
+        return "十" + (digits[n % 10] if n % 10 else "")
+    if n < 100:
+        return digits[n // 10] + "十" + (digits[n % 10] if n % 10 else "")
+    rest = n % 100
+    return "一百" + ("" if rest == 0 else ("零" + digits[rest] if rest < 10 else "一" + zh_number(rest) if rest < 20 else zh_number(rest)))
 
 
 def region_text(region, style):
@@ -72,6 +91,8 @@ def region_text(region, style):
         return f"以{_ns(cla)}度、{_ew(clo)}度为中心，南北各{(la1 - la0) / 2:g}度、东西各{(lo1 - lo0) / 2:g}度的方框"
     if style == "short_zh":
         return f"{nsz}{lat_lo:g}-{lat_hi:g}°，{ewz}{lon_lo:g}-{lon_hi:g}°"
+    if style == "zh_numerals":
+        return f"{nsz}{zh_number(int(lat_lo))}度到{zh_number(int(lat_hi))}度、{ewz}{zh_number(int(lon_lo))}度到{zh_number(int(lon_hi))}度"
     return f"{lat_lo:g}-{lat_hi:g}{ns}, {lon_lo:g}-{lon_hi:g}{ew}"
 
 
@@ -250,11 +271,27 @@ def apply_followup(spec, kind, rng, blocks):
     return final, f"区域整体往{direction}平移10度（不要写出新的边界数字，只说平移方向和距离），其他要求不变"
 
 
-def sample_specs(split, count, data, seed=0):
-    """Predeclared sampling of v2 specs for one split (no text yet)."""
+def reserved_blocks(index):
+    """test-spatial candidate boxes: 10-degree boxes inside the reserved region's interior (1-degree buffer), with
+    their test-period profile counts. The reserved interior is 18 x 38 degrees, so boxes start at -39/-31 latitude and
+    -39/-29/-19/-11 longitude (the -19 and -11 boxes overlap)."""
+    labels = partition_of(index["time"], index["latitude"], index["longitude"])
+    inside = index[np.asarray(labels) == "test-reserved"]
+    boxes = {}
+    for lat0 in (-39, -31):
+        for lon0 in (-39, -29, -19, -11):
+            boxes[(lat0, lon0)] = int((inside["latitude"].between(lat0, lat0 + 10, inclusive="left")
+                                       & inside["longitude"].between(lon0, lon0 + 10, inclusive="left")).sum())
+    return boxes
+
+
+def sample_specs(split, count, data, seed=0, scope=None):
+    """Predeclared sampling of v2 specs for one split (no text yet). scope "test-spatial": test-period requests inside
+    the reserved region. Test requests alternate seen / held-out writing styles (`style_split`)."""
     rng = random.Random(seed)
+    scope = scope or split
     months = split_months(split)
-    blocks = dev_blocks(data.index, split)
+    blocks = reserved_blocks(data.index) if scope == "test-spatial" else dev_blocks(data.index, split)
     ordered = sorted(blocks, key=lambda b: blocks[b])
     tertiles = np.array_split(np.array(ordered, dtype=object), 3)
     plan = []
@@ -287,15 +324,25 @@ def sample_specs(split, count, data, seed=0):
             final["request_type"], final["followup"] = "multiturn", {"type": follow, "change": change}
             final["first"] = spec
             spec = final
-        spec["id"] = f"{split}2-{i:04d}"
+        spec["id"] = f"{ID_PREFIX.get(scope, split)}2-{i:04d}"
+        if scope != split:
+            spec["scope"] = scope
+        if split == "test":
+            spec["style_split"] = "unseen" if i % 2 else "seen"
         specs.append(spec)
     return specs
+
+
+ID_PREFIX = {"test-spatial": "testsp"}
 
 
 def writer_messages(spec, attempt, seed=0, followup=False):
     """Prompt for the teacher to write one user message (the first request, or the follow-up of a multiturn task)."""
     rng = random.Random(f"{seed}:{spec['id']}:{attempt}:{followup}")
-    persona, tone, coords = rng.choice(PERSONAS), rng.choice(TONES), rng.choice(COORDINATE_STYLES)
+    if spec.get("style_split") == "unseen":
+        persona, tone, coords = rng.choice(TEST_PERSONAS), rng.choice(TEST_TONES), rng.choice(TEST_COORDINATE_STYLES)
+    else:
+        persona, tone, coords = rng.choice(PERSONAS), rng.choice(TONES), rng.choice(COORDINATE_STYLES)
     if followup:
         system = ("你在为一个海洋数据分析助手构造真实的多轮对话。用户刚才提了一个请求，助手已经完成并交付了结果。"
                   "现在请以同一位用户的口吻写一条简短的追问，只表达下面这个改动，自然口语即可，不要重复整段原始请求，"

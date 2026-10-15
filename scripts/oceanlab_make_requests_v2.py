@@ -66,7 +66,7 @@ def scripted(tokenizer, texts):
 def build_task(spec, gen, lab, tokenizer):
     """The final task: text, optional multiturn history (first turn answered by the oracle), reference."""
     task = {k: v for k, v in spec.items() if k not in ("first", "period_fact")}
-    task.update(text=gen["text"], task_version=f"oceanlab_{spec['split']}_v2",
+    task.update(text=gen["text"], task_version=f"oceanlab_{spec.get('scope', spec['split'])}_v2",
                 generation={"attempts": gen["attempts"], "style": gen["style"]})
     if spec["request_type"] == "multiturn":
         first = {**spec["first"], "id": spec["id"] + "-turn1", "text": gen["text"]}
@@ -103,7 +103,7 @@ def process(specs, quota, args, data, teacher):
         if gen["ok"] and (quota is None or used[stratum(spec)] < quota[stratum(spec)]):
             used[stratum(spec)] += 1
             chosen.append((spec, gen))
-    lab = OceanLab(args.split, data)
+    lab = OceanLab(args.scope, data)
     tokenizer = native_tokenizer(args.model_path, False)
     harness = OceanLabHarness(Scorer(data), prompt="v2")
     tasks, rejected = [], []
@@ -130,7 +130,8 @@ def describe(tasks):
     return {"request_type": count(lambda t: t["request_type"]), "kind": count(lambda t: f"{t['request_type']}/{t['kind']}"),
             "followup": count(lambda t: t.get("followup", {}).get("type", "-")), "family": count(lambda t: t["family"]),
             "status": count(lambda t: t["reference"]["status"]),
-            "hemisphere": count(lambda t: "N" if t["region"][0][0] >= 0 else "S")}
+            "hemisphere": count(lambda t: "N" if t["region"][0][0] >= 0 else "S"),
+            "style_split": count(lambda t: t.get("style_split", "seen"))}
 
 
 def text_stats(specs, generated):
@@ -145,8 +146,8 @@ def text_stats(specs, generated):
 
 def supplement(args, data, teacher, started):
     """Fill the strata a frozen-in-progress set left short, from a fresh sample (another seed), same pipeline."""
-    path = args.output / f"oceanlab_{args.split}_v2.jsonl"
-    manifest_path = args.output / f"oceanlab_{args.split}_v2_manifest.json"
+    path = args.output / f"oceanlab_{args.scope}_v2.jsonl"
+    manifest_path = args.output / f"oceanlab_{args.scope}_v2_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     need = collections.Counter(manifest["unfilled_strata"])
     if not manifest.get("supplements"):  # rounded quotas sum below the plan; sample_specs pads with paraphrase/mld
@@ -161,13 +162,14 @@ def supplement(args, data, teacher, started):
     keys = {spec_key(t) for t in existing}
     seed = args.seed + 1000 * (len(manifest.get("supplements", [])) + 1)
     candidates, taken = [], collections.Counter()
-    for s in r2.sample_specs(args.split, max(400, 4 * sum(need.values())), data, seed=seed):
+    for s in r2.sample_specs(args.split, max(400, 4 * sum(need.values())), data, seed=seed, scope=args.scope):
         if stratum(s) in need and spec_key(s) not in keys and taken[stratum(s)] < 2 * need[stratum(s)] + 2:
             taken[stratum(s)] += 1
             candidates.append(s)
     specs = candidates  # at most twice the shortfall (+2) per stratum, in sampling order
+    prefix = r2.ID_PREFIX.get(args.scope, args.split)
     for s in specs:
-        s["id"] = s["id"].replace(f"{args.split}2-", f"{args.split}2s{seed // 1000}-")
+        s["id"] = s["id"].replace(f"{prefix}2-", f"{prefix}2s{seed // 1000}-")
     generated, used, tasks, rejected = process(specs, need, args, data, teacher)
     with path.open("a", encoding="utf-8") as f:
         for task in tasks:
@@ -182,7 +184,7 @@ def supplement(args, data, teacher, started):
     manifest.update(kept=len(everything), unfilled_strata={k: v for k, v in still.items() if v > 0}, **describe(everything),
                     sha256=file_hash(path))
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1) + "\n")
-    with (args.output / f"oceanlab_{args.split}_v2_generation_log.jsonl").open("a", encoding="utf-8") as f:
+    with (args.output / f"oceanlab_{args.scope}_v2_generation_log.jsonl").open("a", encoding="utf-8") as f:
         for s, g in zip(specs, generated):
             f.write(json.dumps({"id": s["id"], **g}, ensure_ascii=False) + "\n")
     print(json.dumps({k: manifest[k] for k in ("kept", "unfilled_strata", "status")} | {"supplement": manifest["supplements"][-1]["kept"]},
@@ -191,7 +193,9 @@ def supplement(args, data, teacher, started):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--split", choices=["train", "dev"], required=True)
+    p.add_argument("--split", choices=["train", "dev", "test"], required=True)
+    p.add_argument("--scope", choices=["train", "dev", "test", "test-spatial"],
+                   help="environment partition (default: the split); test-spatial = test years inside the reserved region")
     p.add_argument("--count", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--limit", type=int, default=0, help="pilot: N evenly spaced sampled specs")
@@ -201,16 +205,19 @@ def main():
     p.add_argument("--output", type=Path, default=ROOT / "data/processed/oceanlab/v2")
     p.add_argument("--model_path", type=Path, default=Path("/data/anhuang/oceanheart_models/qwen3-1.7b"))
     args = p.parse_args()
+    args.scope = args.scope or args.split
+    if args.scope not in (args.split, "test-spatial") or (args.scope == "test-spatial" and args.split != "test"):
+        raise ValueError("scope must be the split, or test-spatial with --split test")
     started = time.monotonic()
     data = OceanDepths()
     teacher = Teacher(args.cache)
     if args.supplement:
         return supplement(args, data, teacher, started)
-    version = f"oceanlab_{args.split}_v2" + (f"_pilot{args.limit}" if args.limit else "")
+    version = f"oceanlab_{args.scope}_v2" + (f"_pilot{args.limit}" if args.limit else "")
     path = args.output / f"{version}.jsonl"
     if path.exists() and not args.limit:
         raise FileExistsError(f"{path} exists; request sets are frozen once written")
-    specs = r2.sample_specs(args.split, round(args.count * 1.1), data, seed=args.seed)
+    specs = r2.sample_specs(args.split, round(args.count * 1.1), data, seed=args.seed, scope=args.scope)
     quota = collections.Counter({f"{rtype}/{family}": round(args.count * share * fshare)
                                  for rtype, share in r2.TYPE_SHARE.items() for family, fshare in r2.FAMILY_SHARE.items()})
     if args.limit:  # pilot: an evenly spaced sample across strata
@@ -219,7 +226,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     write_jsonl(path, tasks)
     manifest = {
-        "version": version, "split": args.split, "seed": args.seed, "dataset_revision": REVISION, "qc_policy": QC_POLICY,
+        "version": version, "split": args.split, "scope": args.scope, "seed": args.seed, "dataset_revision": REVISION, "qc_policy": QC_POLICY,
         "partition": PARTITION, "teacher": teacher.model, "sampled": len(specs), "planned": args.count,
         "text_verified": sum(g["ok"] for g in generated), "kept": len(tasks), "rejected": rejected,
         "unfilled_strata": {k: quota[k] - used[k] for k in quota if used[k] < quota[k]} if not args.limit else {},

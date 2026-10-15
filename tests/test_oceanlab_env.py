@@ -411,6 +411,34 @@ class RequestSetV2Tests(unittest.TestCase):
         self.assertEqual(region_text(box, "center"), "以南纬15度、西经125度为中心，南北各5度、东西各5度的方框")
         self.assertIn("经度-130到-120", region_text(box, "signed"))
 
+    def test_held_out_styles_for_the_test_sets(self):
+        from agent.oceanlab import requests_v2 as r2
+        self.assertEqual([r2.zh_number(n) for n in (0, 9, 10, 15, 29, 40, 100, 105, 110, 115, 170, 179)],
+                         ["零", "九", "十", "十五", "二十九", "四十", "一百", "一百零五", "一百一十", "一百一十五", "一百七十", "一百七十九"])
+        self.assertEqual(r2.region_text([[-39, -29], [-11, -1]], "zh_numerals"), "南纬二十九度到三十九度、西经一度到十一度")
+        self.assertFalse(set(r2.TEST_PERSONAS) & set(r2.PERSONAS) or set(r2.TEST_TONES) & set(r2.TONES)
+                         or set(r2.TEST_COORDINATE_STYLES) & set(r2.COORDINATE_STYLES))
+        seen, unseen = {"id": "test2-0000", "style_split": "seen"}, {"id": "test2-0001", "style_split": "unseen"}
+        for spec, personas in ((seen, r2.PERSONAS), (unseen, r2.TEST_PERSONAS)):
+            for attempt in range(4):
+                base = {**spec, "region": [[10, 20], [100, 110]], "period_fact": "2021年3月", "analyses": ["mld"],
+                        "family": "mld"}
+                _, style = r2.writer_messages(base, attempt)
+                self.assertIn(style["persona"], personas)
+
+    def test_reserved_boxes_stay_inside_the_reserved_interior(self):
+        from agent.oceanlab import requests_v2 as r2
+        from agent.oceanlab.data import query_partition
+        from agent.oceanlab.tasks import block_box
+        index = pd.DataFrame({"time": pd.to_datetime(["2021-03-05", "2021-03-06", "2018-03-05", "2021-03-07"]),
+                              "latitude": [-35.0, -25.0, -35.0, -50.0], "longitude": [-35.0, -5.0, -35.0, -35.0]})
+        boxes = r2.reserved_blocks(index)
+        self.assertEqual(len(boxes), 8)
+        self.assertEqual((boxes[(-39, -39)], boxes[(-31, -11)], boxes[(-31, -39)]), (1, 1, 0))
+        for block in boxes:
+            lat, lon = block_box(block)
+            self.assertEqual(query_partition("test-spatial", lat, lon, "2021-03-01", "2021-03-31"), "test-reserved")
+
     def test_extraction_must_match_the_spec_exactly(self):
         from agent.oceanlab.requests_v2 import mismatches
         spec = {"region": [[-20, -10], [120, 130]], "groups": [{"months": ["2018-03"]}, {"months": ["2018-04"]}],
